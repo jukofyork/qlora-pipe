@@ -210,8 +210,11 @@ def apply_max_norm_regularization(model, config):
     approximate Frobenius norm of E = CᵗC - I.
 
     Approximate Frobenius Norm of E:
+    
+        Using: ||A||_F² = Tr(AᵗA) = Tr(AAᵗ)
 
-        E_norm² ≈ 2 * ||AᵗB||_F² + 2 * Tr(AᵗA * BᵗB)
+        E_norm² ≈ 2 * ||AᵗB||_F² + 2 * Tr(AᵗA * BᵗB) + (higher-order terms)
+                ≈ 2 * ||BᵗA||_F² + 2 * Tr(AᵗA * BᵗB) + (higher-order terms)
 
     This approximation uses the leading second-order terms and neglects higher-order terms that become
     negligible for large n (the dimension of A and B).
