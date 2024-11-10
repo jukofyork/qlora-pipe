@@ -17,27 +17,38 @@
 #   Support for Logit Scaling:
 #   - Added support for logit scaling via the `LOGIT_SCALE` parameter.
 #   - This allows scaling logits by a constant factor before computing the loss for use with Cohere models.
-#   - This also allows Focal Loss* to be implemented.
-#   - See: https://arxiv.org/abs/1708.02002 (Appendix A/B)
+#   - This also allows Focal Loss* to be implemented, see: https://arxiv.org/abs/1708.02002 (Appendix A/B)
 #
 #   Support for Label Smoothing:
 #   - Added support for label smoothing via the `LABEL_SMOOTHING_LAMBDA` parameter.
 #   - The smoothed labels are: y_smooth = (1 - λ) * y + λ * u, where u ~ Uniform(1 / VOCAB_SIZE)
-#   - Loss = CE_loss(y_smooth, p)
-#          = (1 - λ) * CE_loss(y, p) + λ * CE_loss(u, p)
-#          = (1 - λ) * (-Σ y_i * log p_i) + λ * (-Σ u_i * log p_i)
-#          = (1 - λ) * H(y, p) + λ * H(u, p)
-#          = (1 - λ) * [H(y) + D_KL(y || p)] + λ * [H(u) + D_KL(u || p)]
-#   - Since H(y) = 0 (because y is one-hot) and H(u) is constant, minimizing the loss is equivalent to minimizing:
-#          (1 - λ) * D_KL(y || p) + λ * D_KL(u || p)
-#   - The term D_KL(u || p) relates to the negative entropy of p:
-#          D_KL(u || p) = log(VOCAB_SIZE) - H(p)
-#     where log(VOCAB_SIZE) is constant with respect to p.
-#   - Therefore, minimizing D_KL(u || p) is equivalent to maximizing H(p), the entropy of the predictions.
-#   - This means label smoothing inherently adds an entropy regularization term λ * H(p),
-#     encouraging higher entropy in predictions and reducing over-confidence.
-#   - As a result, we do not need a separate entropy regularization function;
-#     label smoothing already serves this purpose within the loss function.
+#   - The full loss with label smoothing is:
+#         Loss = CE_loss(y_smooth, p)
+#              = (1 - λ) * CE_loss(y, p) + λ * CE_loss(u, p)
+#              = (1 - λ) * (-Σ y_i * log p_i) + λ * (-Σ u_i * log p_i)
+#   - For efficiency though, we use the approximation:
+#         Loss = logsumexp - (1 - λ) * z_t + λ * log(V), where V = VOCAB_SIZE
+#     - This approximation avoids having to explicitly compute the sum over all vocabulary
+#       tokens for the uniform distribution term. While not exactly equal, it maintains 
+#       the same optimization behaviour since log(V) is constant w.r.t the parameters.
+#     - The backward pass still computes the exact gradients using:
+#           dL/dz_i = p_i - [(1-λ) * y_i + λ/V]
+#   - Also notice this equivalent formulation of label-smoothed loss:
+#          Loss = (1 - λ) * CE_loss(y, p) + λ * CE_loss(u, p)
+#               = (1 - λ) * H(y, p) + λ * H(u, p)
+#               = (1 - λ) * [H(y) + D_KL(y || p)] + λ * [H(u) + D_KL(u || p)]
+#     - Since H(y) = 0 (because y is one-hot) and H(u) is constant, minimizing the loss
+#       is equivalent to minimizing:
+#           (1 - λ) * D_KL(y || p) + λ * D_KL(u || p)
+#     - The term D_KL(u || p) relates to the negative entropy of p:
+#           D_KL(u || p) = log(V) - H(p)
+#       where log(V) is constant with respect to p.
+#     - Therefore, minimizing D_KL(u || p) is equivalent to maximizing H(p), the entropy
+#       of the predictions. This means label smoothing inherently adds an entropy
+#       regularization term λ * H(p), encouraging higher entropy in predictions and
+#       reducing over-confidence. As a result, we do not need a separate entropy
+#       regularization function; label smoothing already serves this purpose within
+#       the loss function!
 #   - See: https://arxiv.org/abs/1701.06548 (Section 3.2)
 #          https://arxiv.org/abs/1906.02629
 #          https://arxiv.org/abs/1611.01838
@@ -101,13 +112,21 @@ def _cross_entropy_forward(
       When logit scaling is applied, each logit z_i is scaled by s:
         z_i = s * z_i
 
-    For label smoothing:
+    For label smoothing, we use an efficient approximation:
 
       With label smoothing, the targets y_i are modified:
         y_t = (1 - λ) for the true label
         y_i = λ / V   for all other labels i != t
-      The loss becomes:
-        CE = logsumexp - (1 - λ) * z_t + λ * log(V)
+        
+      Instead of computing the full loss:
+        CE = (1-λ)*(-log p_t) + λ*(-Σ (1/V)*log p_i)
+    
+      We use:
+        CE ≈ logsumexp - (1-λ)*z_t + λ*log(V)
+    
+      This avoids having to explicitly sum over the full vocabulary for the
+      uniform distribution term, while maintaining equivalent optimization
+      behaviour since log(V) is constant w.r.t the parameters.
     """
     row_idx = tl.program_id(0)
     logits_ptr    += row_idx * logits_row_stride.to(tl.int64)
@@ -142,7 +161,7 @@ def _cross_entropy_forward(
             z_t = LOGIT_SCALE * z_t
 
         if DO_LABEL_SMOOTHING:
-            # Compute loss with label smoothing:
+            # Approximation of the loss with label smoothing:
             # CE = logsumexp - (1 - λ) * z_t + λ * log(V)
             loss = logsumexp - (1.0 - LABEL_SMOOTHING_LAMBDA) * z_t + LABEL_SMOOTHING_LAMBDA * tl.log(float(VOCAB_SIZE))
         else:
@@ -209,24 +228,20 @@ def _chunked_cross_entropy_forward(
         loss = logsumexp_total - z_t
 
       If label smoothing is enabled:
-        loss = logsumexp_total - (1 - lambda) * z_t + lambda * log(V)
+        loss = logsumexp_total - (1 - λ) * z_t + λ * log(V)
 
       where:
-        lambda is the label smoothing coefficient (LABEL_SMOOTHING_LAMBDA)
+        λ is the label smoothing coefficient (LABEL_SMOOTHING_LAMBDA)
         V is the vocabulary size (VOCAB_SIZE)
 
-     For logit scaling:
+    For logit scaling:
 
       When logit scaling is applied, each logit z_i is scaled by s:
         z_i = s * z_i
       Similarly, the true label's logit z_t is scaled:
         z_t = s * z_t
 
-    For label smoothing:
-
-      The target labels y_i are modified:
-        For the true label (i == t):   y_t = 1 - lambda
-        For all other labels (i != t):  y_i = lambda / V
+    For label smoothing, we use an efficient approximation (see above).
     """
     row_idx   = tl.program_id(0)
     chunk_idx = tl.program_id(1)
@@ -267,7 +282,7 @@ def _chunked_cross_entropy_forward(
                 z_t = LOGIT_SCALE * z_t
 
             if DO_LABEL_SMOOTHING:
-                # Compute the partial loss with label smoothing:
+                # Approximation of the loss with label smoothing:
                 # loss = - (1 - lambda) * z_t + lambda * log(V)
                 loss = - (1.0 - LABEL_SMOOTHING_LAMBDA) * z_t + LABEL_SMOOTHING_LAMBDA * tl.log(float(VOCAB_SIZE))
             else:
