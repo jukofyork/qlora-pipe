@@ -82,19 +82,23 @@ class ComputeMetrics(nn.Module):
             self,
             logit_scale=1.0,
             loss_type='cross_entropy_loss',
-            focal_loss_gamma=0
+            focal_loss_gamma=0,
+            label_smoothing_lambda=0
         ):
         super().__init__()
         self.logit_scale = logit_scale
         self.loss_type = loss_type.lower()
         self.focal_loss_gamma = focal_loss_gamma
+        self.label_smoothing_lambda = label_smoothing_lambda
 
         if self.logit_scale <= 0:
             raise ValueError("logit_scale must be greater than 0")
         if self.loss_type == 'cross_entropy_loss' and self.focal_loss_gamma != 0:
             raise ValueError("focal_loss_gamma can't be used with 'cross_entropy_loss' function")
         elif self.loss_type != 'cross_entropy_loss' and self.focal_loss_gamma <= 0:
-            raise ValueError("focal_loss_gamma must be greater than 0 for the specified loss function")
+            raise ValueError(f"focal_loss_gamma must be greater than 0 for use with the \'{self.loss_type}\' function")
+        if self.label_smoothing_lambda < 0 or self.label_smoothing_lambda >= 1:
+            raise ValueError("label_smoothing_lambda must be in the range [0, 1)")
 
     def forward(self, inputs):
         logits, labels = inputs
@@ -112,7 +116,8 @@ class ComputeMetrics(nn.Module):
         cross_entropy_loss_unreduced = Fast_CrossEntropyLoss.apply(
             shift_logits,
             shift_labels,
-            self.logit_scale
+            self.logit_scale,
+            self.label_smoothing_lambda
         )
         cross_entropy_loss_unreduced = cross_entropy_loss_unreduced[valid_loss]
 
@@ -128,10 +133,22 @@ class ComputeMetrics(nn.Module):
             loss_unreduced = Fast_CrossEntropyLoss.apply(
                 shift_logits,
                 shift_labels,
-                self.logit_scale * self.focal_loss_gamma
+                self.logit_scale * self.focal_loss_gamma,  # Remember to scale by original too!
+                self.label_smoothing_lambda
             )
             loss_unreduced = loss_unreduced[valid_loss]
             loss_unreduced = loss_unreduced / self.focal_loss_gamma
+        elif self.loss_type == 'inverse_focal_loss':
+            # See "Rethinking Calibration of Deep Neural Networks: Do Not Be Afraid of Overconfidence" (Section 5.2)
+            p = torch.exp(-cross_entropy_loss_unreduced)
+            loss_unreduced = (1+p)**self.focal_loss_gamma * cross_entropy_loss_unreduced
+        elif self.loss_type == 'quadratic_cross_entropy_loss':
+            # See "Gradient as a Foundation for Building a Loss Function" (Section III.B)
+            # NOTE: This is a generalisation of their loss to arbitrary powers:
+            #       - gamma=2 matches their Quadratic Cross-Entropy loss.
+            #       - gamma=1 simplifies to standard Cross-Entropy loss.
+            #       - gamma<1 has a similar effect to Focal Loss with gamma<1.
+            loss_unreduced = cross_entropy_loss_unreduced**self.focal_loss_gamma / self.focal_loss_gamma
         else:
             raise NotImplementedError(self.loss_type)
         
@@ -154,9 +171,13 @@ class PipelineModel(nn.Module):
         self.loader_util = LoaderUtil(config['model'], quantization_config, self.modules_to_not_quantize)
         self.loss_type = config.get('loss_type', 'cross_entropy_loss').lower()
         self.focal_loss_gamma = config.get('focal_loss_gamma', 0)
-        if self.focal_loss_gamma > 0 and is_main_process():
-            print(f'Optimizing using \'{self.loss_type}\' with gamma={self.focal_loss_gamma}')
-
+        self.label_smoothing_lambda = config.get('label_smoothing_lambda', 0)
+        if is_main_process():
+            if self.focal_loss_gamma > 0:
+                print(f'Optimizing using \'{self.loss_type}\' with gamma={self.focal_loss_gamma}')
+            if self.label_smoothing_lambda > 0:
+                print(f'Optimizing using label smoothing with lambda={self.label_smoothing_lambda}')
+            
         for name, p in self.named_parameters():
             p.original_name = name
 
