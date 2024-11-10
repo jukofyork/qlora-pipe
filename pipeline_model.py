@@ -121,6 +121,9 @@ class ComputeMetrics(nn.Module):
         )
         cross_entropy_loss_unreduced = cross_entropy_loss_unreduced[valid_loss]
 
+        # TODO: The way we calculate p using the exponentiated CE loss means using focal loss
+        #       at the same time as label smoothing will give *slightly* wrong results...
+        #       - This probably doesn't matter much as lambda will generally need to be very small.
         if self.loss_type == 'cross_entropy_loss':
             loss_unreduced = cross_entropy_loss_unreduced
         elif self.loss_type == 'focal_loss':
@@ -177,6 +180,8 @@ class PipelineModel(nn.Module):
                 print(f'Optimizing using \'{self.loss_type}\' with gamma={self.focal_loss_gamma}')
             if self.label_smoothing_lambda > 0:
                 print(f'Optimizing using label smoothing with lambda={self.label_smoothing_lambda}')
+            if self.focal_loss_gamma > 0 and self.label_smoothing_lambda > 0:
+                print("WARNING: Using label smoothing with focal loss might be problematic (see the TODO)")
             
         for name, p in self.named_parameters():
             p.original_name = name
