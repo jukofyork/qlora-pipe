@@ -11,55 +11,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+#
 # Modifications by Juk Armstrong, November 2024:
+# ==============================================
 #
-#   Support for Logit Scaling:
-#   - Added support for logit scaling via the `LOGIT_SCALE` parameter.
-#   - This allows scaling logits by a constant factor before computing the loss for use with Cohere models.
-#   - This also allows Focal Loss* to be implemented, see: https://arxiv.org/abs/1708.02002 (Appendix A/B)
+# Added support for Logit Scaling:
+# - This allows scaling logits by a constant factor before computing the loss,
+#   which can be useful for models requiring temperature scaling or adjusting
+#   the sharpness of the softmax.
+# - This also facilitates the implementation of Focal Loss:
+#   https://arxiv.org/abs/1708.02002 (Appendix A and B).
 #
-#   Support for Label Smoothing:
-#   - Added support for label smoothing via the `LABEL_SMOOTHING_LAMBDA` parameter.
-#   - The smoothed labels are: y_smooth = (1 - λ) * y + λ * u, where u ~ Uniform(1 / VOCAB_SIZE)
-#   - The full loss with label smoothing is:
-#         Loss = CE_loss(y_smooth, p)
-#              = (1 - λ) * CE_loss(y, p) + λ * CE_loss(u, p)
-#              = (1 - λ) * (-Σ y_i * log p_i) + λ * (-Σ u_i * log p_i)
-#   - For efficiency though, we use the approximation:
-#         Loss = logsumexp - (1 - λ) * z_t + λ * log(V), where V = VOCAB_SIZE
-#     - This approximation avoids having to explicitly compute the sum over all vocabulary
-#       tokens for the uniform distribution term. While not exactly equal, it maintains 
-#       the same optimization behaviour since log(V) is constant w.r.t the parameters.
-#     - The backward pass still computes the exact gradients using:
-#           dL/dz_i = p_i - [(1-λ) * y_i + λ/V]
-#   - Also notice this equivalent formulation of label-smoothed loss:
-#          Loss = (1 - λ) * CE_loss(y, p) + λ * CE_loss(u, p)
-#               = (1 - λ) * H(y, p) + λ * H(u, p)
-#               = (1 - λ) * [H(y) + D_KL(y || p)] + λ * [H(u) + D_KL(u || p)]
-#     - Since H(y) = 0 (because y is one-hot) and H(u) is constant, minimizing the loss
-#       is equivalent to minimizing:
-#           (1 - λ) * D_KL(y || p) + λ * D_KL(u || p)
-#     - The term D_KL(u || p) relates to the negative entropy of p:
-#           D_KL(u || p) = log(V) - H(p)
-#       where log(V) is constant with respect to p.
-#     - Therefore, minimizing D_KL(u || p) is equivalent to maximizing H(p), the entropy
-#       of the predictions. This means label smoothing inherently adds an entropy
-#       regularization term λ * H(p), encouraging higher entropy in predictions and
-#       reducing over-confidence. As a result, we do not need a separate entropy
-#       regularization function; label smoothing already serves this purpose within
-#       the loss function!
-#   - See: https://arxiv.org/abs/1701.06548 (Section 3.2)
-#          https://arxiv.org/abs/1906.02629
-#          https://arxiv.org/abs/1611.01838
-#
-#   Code Clean-Up and Documentation:
-#   - Updated variable names for better readability and consistency with standard naming conventions.
-#   - Added detailed comments explaining the existing/new mathematics and implementation details.
-#
-# NOTE: In the backward pass, the logits' gradients are stored directly into the `logits` tensor.
-#       - This seems to be a deliberate design choice to save GPU memory...
-#       - As a result, the original values of `logits` will be overwritten.
+# Added support for Label Smoothing:
+# - The smoothed labels are: y_smooth = (1 - gamma) * y + gamma / |V|
+# - The full loss with label smoothing, where U ~ Uniform(1 / |V|):
+#       Loss = CE_loss(y_smooth, p)
+#            = (1 - gamma) * H(y, p) + gamma * H(U, p)
+#            = (1 - gamma) * (-Σ y_i * log(p_i)) + gamma * (-Σ u_i * log(p_i))
+# - For efficiency, we use the approximation:
+#       Loss ≈ logsumexp - (1 - gamma) * z_target + gamma * log(|V|)
+#   This approximation avoids explicitly summing over all vocabulary tokens
+#   for the uniform term and maintains similar optimization behaviour since
+#   the value log(|V|) is constant with respect to the parameters.
+# - The backward pass computes the gradients as:
+#       dL/dz_i = p_i - y_smooth_i
+#   where y_smooth_i includes the label smoothing adjustments.
 
 import triton
 import triton.language as tl
@@ -81,52 +57,47 @@ def _cross_entropy_forward(
     VOCAB_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     DO_LOGIT_SCALING: tl.constexpr,
-    LOGIT_SCALE: tl.constexpr,
+    LOGIT_SCALE_FACTOR: tl.constexpr,
     DO_LABEL_SMOOTHING: tl.constexpr,
-    LABEL_SMOOTHING_LAMBDA: tl.constexpr,
+    SMOOTHING_GAMMA: tl.constexpr,
 ):
     """
-    Cross Entropy Loss = 1/n sum [ y_i log(p_i) ] where:
-      p_i = exp(z_i) / sum_j exp(z_j)   # Softmax probability
-      y_i = target label (one-hot or smoothed)
-
-    For standard cross-entropy with one-hot targets:
-      y_i = 1 if i == t (true label)
-      y_i = 0 otherwise
-
-    The loss simplifies to:
-    CE = log(p_t)
-       = [ z_t - logsumexp ]
-       = logsumexp - z_t
-
-    where:
-      z_i: logit for class i
-      z_t: logit corresponding to the true label
-      logsumexp: log( sum_j exp(z_j) )
-
-    Stability trick for computing logsumexp:
-      logsumexp = c + log( sum_j exp(z_j - c) ), where c = max(z_j)
-
-    For logit scaling:
-
-      When logit scaling is applied, each logit z_i is scaled by s:
-        z_i = s * z_i
-
-    For label smoothing, we use an efficient approximation:
-
-      With label smoothing, the targets y_i are modified:
-        y_t = (1 - λ) for the true label
-        y_i = λ / V   for all other labels i != t
+        Cross-Entropy Loss for a single sample is defined as:
+            Loss = -y_target * log(p_target)
+        Where:
+            - y_target is the target label (1 for correct class, 0 otherwise).
+            - p_target is the predicted probability for the target class.
         
-      Instead of computing the full loss:
-        CE = (1-λ)*(-log p_t) + λ*(-Σ (1/V)*log p_i)
-    
-      We use:
-        CE ≈ logsumexp - (1-λ)*z_t + λ*log(V)
-    
-      This avoids having to explicitly sum over the full vocabulary for the
-      uniform distribution term, while maintaining equivalent optimization
-      behaviour since log(V) is constant w.r.t the parameters.
+        Given the logits z_i, the predicted probabilities p_i are computed using softmax:
+            p_i = exp(z_i) / sum_j exp(z_j)
+        
+        Combining these, the loss can be rewritten:
+            Loss = -log(p_target)
+                 = -log(exp(z_target) / sum_j exp(z_j))
+                 = - (z_target - logsumexp)
+        
+        Where:
+            logsumexp = log(sum_j exp(z_j))
+        
+        To compute logsumexp in a numerically stable way, we use the trick:
+            logsumexp = max_z + log(sum_j exp(z_j - max_z))
+        
+        When logit scaling is applied, each logit z_i is scaled by s:
+            z_i = s * z_i
+                
+        With label smoothing, the targets y_i are modified:
+            y_target = (1 - gamma) for the true label
+            y_i = gamma / |V|   for all other labels i != t
+        
+        Instead of computing the full loss:
+            Loss = (1-gamma)*(-log p_t) + gamma*(-Σ (1/|V|)*log p_i)
+        
+        We use:
+            Loss ≈ logsumexp - (1-gamma)*z_target + gamma*log(|V|)
+        
+        This avoids having to explicitly sum over the full vocabulary for the uniform
+        distribution term,while maintaining equivalent optimization behaviour since
+        the value of log(|V|) is constant w.r.t the parameters.
     """
     row_idx = tl.program_id(0)
     logits_ptr    += row_idx * logits_row_stride.to(tl.int64)
@@ -135,43 +106,27 @@ def _cross_entropy_forward(
     labels_ptr    += row_idx
 
     col_offsets = tl.arange(0, BLOCK_SIZE)
-
-    # Create a mask to prevent out-of-bounds access for vocab sizes not divisible by BLOCK_SIZE
     mask = col_offsets < VOCAB_SIZE
 
-    # Assuming label_idx ∈ [0, VOCAB_SIZE - 1] or -100 for ignore index
     label_idx = tl.load(labels_ptr).to(tl.int32)
-
-    # Load logits z_i
-    z = tl.load(logits_ptr + col_offsets, mask=mask, other=-float("inf")).to(tl.float32)
-
+    logits = tl.load(logits_ptr + col_offsets, mask=mask, other=-float("inf")).to(tl.float32)
     if DO_LOGIT_SCALING:
-        # Apply logit scaling: z_i = s * z_i
-        z = LOGIT_SCALE * z
+        logits = LOGIT_SCALE_FACTOR * logits
 
-    # Compute logsumexp = log( sum_j exp(z_j) ) using stability trick
-    c = tl.max(z, 0)  # c = max(z_j)
-    logsumexp = c + tl.log(tl.sum(tl.exp(z - c), 0))
+    c = tl.max(logits, 0)
+    logsumexp = c + tl.log(tl.sum(tl.exp(logits - c), 0))
 
     if label_idx != -100:
-        # Load the logit corresponding to the true label: z_t
-        z_t = tl.load(logits_ptr + label_idx).to(tl.float32)
+        logit_target = tl.load(logits_ptr + label_idx).to(tl.float32)
         if DO_LOGIT_SCALING:
-            # Apply logit scaling: z_t = s * z_t
-            z_t = LOGIT_SCALE * z_t
-
+            logit_target = LOGIT_SCALE_FACTOR * logit_target
         if DO_LABEL_SMOOTHING:
-            # Approximation of the loss with label smoothing:
-            # CE = logsumexp - (1 - λ) * z_t + λ * log(V)
-            loss = logsumexp - (1.0 - LABEL_SMOOTHING_LAMBDA) * z_t + LABEL_SMOOTHING_LAMBDA * tl.log(float(VOCAB_SIZE))
+            loss = logsumexp - (1.0 - SMOOTHING_GAMMA) * logit_target + SMOOTHING_GAMMA * tl.log(float(VOCAB_SIZE))
         else:
-            # Standard cross-entropy loss: CE = logsumexp - z_t
-            loss = logsumexp - z_t
+            loss = logsumexp - logit_target
     else:
-        # If label is -100 (ignore index), set loss to 0
         loss = 0.0
 
-    # Store results
     tl.store(logsumexp_ptr, logsumexp)
     tl.store(loss_ptr, loss)
 
@@ -190,109 +145,62 @@ def _chunked_cross_entropy_forward(
     N_CHUNKS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     DO_LOGIT_SCALING: tl.constexpr,
-    LOGIT_SCALE: tl.constexpr,
+    LOGIT_SCALE_FACTOR: tl.constexpr,
     DO_LABEL_SMOOTHING: tl.constexpr,
-    LABEL_SMOOTHING_LAMBDA: tl.constexpr,
+    SMOOTHING_GAMMA: tl.constexpr,
 ):
     """
-    For large vocabularies, the vocabulary is divided into N_CHUNKS chunks.
-    For example, a 256K vocabulary divided into 4 chunks of 65,536 each:
-
-    |-65,536-| |-65,536-| |-65,536-| |-65,536-|
-    |--------| |--------| |--------| |--------|
-    |--------| |--------| |--------| |--------|
-
-    Computing the full cross-entropy loss directly can be challenging due to memory constraints.
-    Instead, we compute the log-sum-exp (logsumexp) over each chunk and then combine them to obtain the total logsumexp.
-
-    TOTAL LOGSUMEXP COMPUTATION:
-
-    The total logsumexp_total is computed as:
-      logsumexp_total = log(sum_j exp(z_j)) = log( sum over all chunks [ sum_{i in chunk} exp(z_i) ] )
-
-    We compute the logsumexp for each chunk:
-      logsumexp_chunk = log( sum_{i in chunk} exp(z_i) )
-
-    Then, we combine the per-chunk logsumexp values:
-      logsumexp_total = log( sum over chunks [ exp(logsumexp_chunk) ] )
-
-    IN THIS KERNEL:
-
-      For each chunk, we compute the chunk's logsumexp and store it in logsumexp_ptr.
-      When chunk_idx == 0, we compute the partial loss involving the true label's logit z_t.
-
-    THE OVERALL LOSS IS COMPUTED OUTSIDE THIS KERNEL BY:
-
-      Combining the per-chunk logsumexp values to get logsumexp_total.
-      Adding the partial loss (computed here) to logsumexp_total to obtain the final loss:
-        loss = logsumexp_total - z_t
-
-      If label smoothing is enabled:
-        loss = logsumexp_total - (1 - λ) * z_t + λ * log(V)
-
-      where:
-        λ is the label smoothing coefficient (LABEL_SMOOTHING_LAMBDA)
-        V is the vocabulary size (VOCAB_SIZE)
-
-    For logit scaling:
-
-      When logit scaling is applied, each logit z_i is scaled by s:
-        z_i = s * z_i
-      Similarly, the true label's logit z_t is scaled:
-        z_t = s * z_t
-
-    For label smoothing, we use an efficient approximation (see above).
+        For large VOCAB_SIZE > 65336, we divide into chunks to fit within MAX_FUSED_SIZE:
+        
+        First split the vocabulary into N_CHUNKS chunks, each of size BLOCK_SIZE.
+        
+        For each chunk, we compute:
+            logsumexp_chunk = max_z_chunk + log(sum_i exp(z_i - max_z_chunk))
+        
+        After computing logsumexp for each chunk, we combine them:
+            logsumexp_total = logsumexp(cat(logsumexp_chunks))
+        
+        This works because:
+            exp(logsumexp_total) = sum_j exp(logsumexp_chunk_j) = sum_i exp(z_i)
+        
+        Thus, we obtain the overall logsumexp needed for the loss computation.
+        
+        The loss for each sample is then:
+            Loss = logsumexp_total - z_target
+        
+        If label smoothing is applied:
+            Loss = logsumexp_total - (1 - gamma) * z_target + gamma * log(|V|)
     """
     row_idx   = tl.program_id(0)
     chunk_idx = tl.program_id(1)
-
-    # Adjust pointers to point to the correct row and chunk
     logits_ptr    += row_idx * logits_row_stride.to(tl.int64)
     loss_ptr      += row_idx
     logsumexp_ptr += row_idx * N_CHUNKS + chunk_idx
     labels_ptr    += row_idx
 
-    # Compute column offsets for the current chunk
     col_offsets = chunk_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    # Create a mask to prevent out-of-bounds access
     mask = col_offsets < VOCAB_SIZE
-    # Load the label index for the current row
+
     label_idx = tl.load(labels_ptr).to(tl.int32)
-
-    # Load logits z_i for the current chunk
-    z = tl.load(logits_ptr + col_offsets, mask=mask, other=-float("inf")).to(tl.float32)
+    logits = tl.load(logits_ptr + col_offsets, mask=mask, other=-float("inf")).to(tl.float32)
     if DO_LOGIT_SCALING:
-        # Apply logit scaling: z_i = s * z_i
-        z = LOGIT_SCALE * z
+        logits = LOGIT_SCALE_FACTOR * logits
 
-    # Compute logsumexp over the chunk using the stability trick
-    c = tl.max(z, 0)  # c = max(z_i) over the chunk
-    logsumexp_chunk = c + tl.log(tl.sum(tl.exp(z - c), 0))
-
-    # Store the chunk's logsumexp
+    c = tl.max(logits, 0)
+    logsumexp_chunk = c + tl.log(tl.sum(tl.exp(logits - c), 0))
     tl.store(logsumexp_ptr, logsumexp_chunk)
 
-    # For the first chunk, compute the partial loss involving z_t
     if chunk_idx == 0:
         if label_idx != -100:
-            # Load the logit corresponding to the true label: z_t
-            z_t = tl.load(logits_ptr + label_idx).to(tl.float32)
+            logit_target = tl.load(logits_ptr + label_idx).to(tl.float32)
             if DO_LOGIT_SCALING:
-                # Apply logit scaling: z_t = s * z_t
-                z_t = LOGIT_SCALE * z_t
-
+                logit_target = LOGIT_SCALE_FACTOR * logit_target
             if DO_LABEL_SMOOTHING:
-                # Approximation of the loss with label smoothing:
-                # loss = - (1 - lambda) * z_t + lambda * log(V)
-                loss = - (1.0 - LABEL_SMOOTHING_LAMBDA) * z_t + LABEL_SMOOTHING_LAMBDA * tl.log(float(VOCAB_SIZE))
+                loss = - (1.0 - SMOOTHING_GAMMA) * logit_target + SMOOTHING_GAMMA * tl.log(float(VOCAB_SIZE))
             else:
-                # Standard cross-entropy loss: loss = - z_t
-                loss = - z_t
+                loss = - logit_target
         else:
-            # If label is -100 (ignore index), set loss to 0
             loss = 0.0
-
-        # Store the partial loss
         tl.store(loss_ptr, loss)
 
 
@@ -309,93 +217,77 @@ def _cross_entropy_backward(
     VOCAB_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     DO_LOGIT_SCALING: tl.constexpr,
-    LOGIT_SCALE: tl.constexpr,
+    LOGIT_SCALE_FACTOR: tl.constexpr,
     DO_LABEL_SMOOTHING: tl.constexpr,
-    LABEL_SMOOTHING_LAMBDA: tl.constexpr,
+    SMOOTHING_GAMMA: tl.constexpr,
 ):
     """
-    Compute gradients of the cross-entropy loss with respect to logits z_i.
-
-    The gradient dL/dz_i is given by:
-      dL/dz_i = p_i - y_i
-
-    where:
-      p_i = exp(z_i) / sum_j exp(z_j)  # Softmax probability
-      y_i = target label
-
-    For logit scaling:
-
-      With logit scaling (z_i = s * z_i), the gradient becomes:
-        dL/dz_i = s * (p_i - y_i)
-
-    For label smoothing:
-
-      y_t = (1 - λ) for the true label
-      y_i = λ / V   for all other labels i != t
+        The gradient of the cross-entropy loss with respect to the logits z_i is:
+        
+            dL/dz_i = p_i - y_i
+        
+        Where:
+            - p_i = exp(z_i - logsumexp) is the predicted probability for class i.
+            - y_i = target probability for class i (1 for the correct class, 0 otherwise).
+        
+        With label smoothing:
+            - For the target class (i = target):
+                y_i = 1 - gamma
+            - For other classes:
+                y_i = gamma / (V - 1)
+        
+        Thus, the gradient becomes:
+            dL/dz_i = p_i - y_i
+        
+        If logit scaling is applied (z_i = s * z_i), then:
+            dL/dz_i = s * (p_i - y_i)
     """
     row_idx   = tl.program_id(0)
     block_idx = tl.program_id(1)
 
     logits_ptr += row_idx * logits_row_stride.to(tl.int64)
     dloss_ptr  += row_idx * dloss_row_stride
-
     col_offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-
-    # Create a mask to prevent out-of-bounds access for vocab sizes not divisible by BLOCK_SIZE
     mask = col_offsets < VOCAB_SIZE
-
-    # Assuming label_idx ∈ [0, VOCAB_SIZE - 1] or -100 for ignore index
     label_idx = tl.load(labels_ptr + row_idx).to(tl.int32)
 
     if label_idx != -100:
-        # Load upstream gradient: dL/dloss
         dloss = tl.load(dloss_ptr)
     else:
         dloss = 0.0
 
-    # Load logits z_i
-    z = tl.load(logits_ptr + col_offsets, mask=mask, other=-float("inf")).to(tl.float32)
+    logits = tl.load(logits_ptr + col_offsets, mask=mask, other=-float("inf")).to(tl.float32)
     if DO_LOGIT_SCALING:
-        # Apply logit scaling: z_i = s * z_i
-        z = LOGIT_SCALE * z
+        logits = LOGIT_SCALE_FACTOR * logits
 
-    # Load logsumexp = log( sum_j exp(z_j) )
     logsumexp = tl.load(logsumexp_ptr + row_idx)
-
-    # Compute softmax probabilities: p_i = exp(z_i - logsumexp)
-    p = tl.exp(z - logsumexp)
+    p = tl.exp(logits - logsumexp)
 
     if DO_LABEL_SMOOTHING:
-        # Compute target labels y_i with label smoothing
-        # y_t = (1 - λ), y_i = λ / V for i != t
-        y_i = LABEL_SMOOTHING_LAMBDA / float(VOCAB_SIZE)
-        y = tl.full_like(p, y_i)
-        y = tl.where(col_offsets == label_idx, 1.0 - LABEL_SMOOTHING_LAMBDA, y)
+        d_logits = tl.where(
+            col_offsets == label_idx,
+            p - (1.0 - SMOOTHING_GAMMA),
+            p - SMOOTHING_GAMMA / float(VOCAB_SIZE)
+        )
     else:
-        # Standard one-hot target labels
-        y = tl.where(col_offsets == label_idx, 1.0, 0.0)
-
-    # Compute gradient: dL/dz_i = p_i - y_i
-    d_logits = p - y
+        d_logits = tl.where(
+            col_offsets == label_idx,
+            p - 1.0,
+            p
+        )
 
     if DO_LOGIT_SCALING:
-        # Account for logit scaling in gradient: dL/dz_i = s * (p_i - y_i)
-        d_logits = LOGIT_SCALE * d_logits
+        d_logits = LOGIT_SCALE_FACTOR * d_logits
 
-    # Multiply with upstream gradient dL/dloss
-    grad = dloss * d_logits
-
-    # Store gradient w.r.t logits
-    # - This seems to be a deliberate design choice to save GPU memory...
-    # - As a result, the original values of `logits` will be overwritten.
-    tl.store(logits_ptr + col_offsets, grad, mask=mask)
+    # NOTE: The original values of `logits` overwritten (deliberate to save VRAM?).
+    tl.store(logits_ptr + col_offsets, dloss * d_logits, mask=mask)
 
 
 MAX_FUSED_SIZE = 65536 # 2**16
 
 class Fast_CrossEntropyLoss(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, logits, labels, logit_scale = 1.0, label_smoothing_lambda = 0.0):
+    def forward(ctx, logits, labels, logit_scale_factor = 1.0, smoothing_gamma = 0.0):
         n_rows, vocab_size = logits.shape
 
         div, mod = divmod(vocab_size, MAX_FUSED_SIZE)
@@ -414,10 +306,10 @@ class Fast_CrossEntropyLoss(torch.autograd.Function):
                 labels,
                 VOCAB_SIZE = vocab_size,
                 BLOCK_SIZE = BLOCK_SIZE,
-                DO_LOGIT_SCALING = (logit_scale != 1.0),
-                LOGIT_SCALE = logit_scale,
-                DO_LABEL_SMOOTHING = (label_smoothing_lambda != 0.0),
-                LABEL_SMOOTHING_LAMBDA = label_smoothing_lambda,
+                DO_LOGIT_SCALING = (logit_scale_factor != 1.0),
+                LOGIT_SCALE_FACTOR = logit_scale_factor,
+                DO_LABEL_SMOOTHING = (smoothing_gamma != 0.0),
+                SMOOTHING_GAMMA = smoothing_gamma,
                 num_warps  = num_warps,
             )
         else:
@@ -432,10 +324,10 @@ class Fast_CrossEntropyLoss(torch.autograd.Function):
                 VOCAB_SIZE = vocab_size,
                 N_CHUNKS   = n_chunks,
                 BLOCK_SIZE = MAX_FUSED_SIZE,
-                DO_LOGIT_SCALING = (logit_scale != 1.0),
-                LOGIT_SCALE = logit_scale,
-                DO_LABEL_SMOOTHING = (label_smoothing_lambda != 0.0),
-                LABEL_SMOOTHING_LAMBDA = label_smoothing_lambda,
+                DO_LOGIT_SCALING = (logit_scale_factor != 1.0),
+                LOGIT_SCALE_FACTOR = logit_scale_factor,
+                DO_LABEL_SMOOTHING = (smoothing_gamma != 0.0),
+                SMOOTHING_GAMMA = smoothing_gamma,
                 num_warps  = 32,
             )
             # logsumexp(chunked_logsumexp) - x
@@ -445,8 +337,8 @@ class Fast_CrossEntropyLoss(torch.autograd.Function):
             losses.masked_fill_(labels == -100, 0) # Don't forget to mask padding out!
 
         ctx.save_for_backward(logits, logsumexp, labels)
-        ctx.logit_scale = logit_scale
-        ctx.label_smoothing_lambda = label_smoothing_lambda
+        ctx.logit_scale_factor = logit_scale_factor
+        ctx.smoothing_gamma = smoothing_gamma
         return losses
 
     @staticmethod
@@ -465,16 +357,21 @@ class Fast_CrossEntropyLoss(torch.autograd.Function):
             labels,
             VOCAB_SIZE = vocab_size,
             BLOCK_SIZE = BLOCK_SIZE,
-            DO_LOGIT_SCALING = (ctx.logit_scale != 1.0),
-            LOGIT_SCALE = ctx.logit_scale,
-            DO_LABEL_SMOOTHING = (ctx.label_smoothing_lambda != 0.0),
-            LABEL_SMOOTHING_LAMBDA = ctx.label_smoothing_lambda,
+            DO_LOGIT_SCALING = (ctx.logit_scale_factor != 1.0),
+            LOGIT_SCALE_FACTOR = ctx.logit_scale_factor,
+            DO_LABEL_SMOOTHING = (ctx.smoothing_gamma != 0.0),
+            SMOOTHING_GAMMA = ctx.smoothing_gamma,
             num_warps  = 8,
         )
         return logits, None, None, None
 
 
-def fast_cross_entropy_loss(logits, labels, logit_scale=1.0, label_smoothing_lambda = 0.0):
+def fast_cross_entropy_loss(
+        logits,
+        labels,
+        logit_scale_factor = 1.0,
+        smoothing_gamma = 0.0
+):
     """
     Arguments:
         logits: (batch, seq_len, vocab_size)
@@ -488,8 +385,8 @@ def fast_cross_entropy_loss(logits, labels, logit_scale=1.0, label_smoothing_lam
     loss = Fast_CrossEntropyLoss.apply(
         logits.view(batch*seq_len, d),
         labels.view(-1),
-        logit_scale,
-        label_smoothing_lambda,
+        logit_scale_factor,
+        smoothing_gamma,
     )
     n_items = torch.count_nonzero(labels != -100)
     return loss.sum() / n_items

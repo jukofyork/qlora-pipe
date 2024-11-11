@@ -225,8 +225,7 @@ class LlamaForCausalLMPipe(PipelineModel, transformers.LlamaForCausalLM):
             LayerSpec(
                 ComputeMetrics,
                 loss_type=self.loss_type,
-                focal_loss_gamma=self.focal_loss_gamma,
-                label_smoothing_lambda=self.label_smoothing_lambda
+                loss_gamma_parameter=self.loss_gamma_parameter
             )
         )
         return result
@@ -271,8 +270,7 @@ class Qwen2ForCausalLMPipe(PipelineModel, transformers.Qwen2ForCausalLM):
             LayerSpec(
                 ComputeMetrics,
                 loss_type=self.loss_type,
-                focal_loss_gamma=self.focal_loss_gamma,
-                label_smoothing_lambda=self.label_smoothing_lambda
+                loss_gamma_parameter=self.loss_gamma_parameter
             )
         )
         return result
@@ -322,8 +320,7 @@ class CohereForCausalLMPipe(PipelineModel, transformers.CohereForCausalLM):
                 ComputeMetrics,
                 logit_scale=self.logit_scale,
                 loss_type=self.loss_type,
-                focal_loss_gamma=self.focal_loss_gamma,
-                label_smoothing_lambda=self.label_smoothing_lambda,
+                loss_gamma_parameter=self.loss_gamma_parameter,
                 _estimated_size=embedding_relative_size
             )
         )
@@ -369,8 +366,7 @@ class Phi3ForCausalLMPipe(PipelineModel, transformers.Phi3ForCausalLM):
             LayerSpec(
                 ComputeMetrics,
                 loss_type=self.loss_type,
-                focal_loss_gamma=self.focal_loss_gamma,
-                label_smoothing_lambda=self.label_smoothing_lambda
+                loss_gamma_parameter=self.loss_gamma_parameter
             )
         )
         return result
@@ -421,8 +417,7 @@ class Gemma2ForCausalLMPipe(PipelineModel, transformers.Gemma2ForCausalLM):
             LayerSpec(
                 ComputeMetrics,
                 loss_type=self.loss_type,
-                focal_loss_gamma=self.focal_loss_gamma,
-                label_smoothing_lambda=self.label_smoothing_lambda,
+                loss_gamma_parameter=self.loss_gamma_parameter,
                 _estimated_size=embedding_relative_size
             )
         )
@@ -468,8 +463,7 @@ class MistralForCausalLMPipe(PipelineModel, transformers.MistralForCausalLM):
             LayerSpec(
                 ComputeMetrics,
                 loss_type=self.loss_type,
-                focal_loss_gamma=self.focal_loss_gamma,
-                label_smoothing_lambda=self.label_smoothing_lambda
+                loss_gamma_parameter=self.loss_gamma_parameter
             )
         )
         return result

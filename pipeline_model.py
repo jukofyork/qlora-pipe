@@ -82,23 +82,21 @@ class ComputeMetrics(nn.Module):
             self,
             logit_scale=1.0,
             loss_type='cross_entropy_loss',
-            focal_loss_gamma=0,
-            label_smoothing_lambda=0
+            loss_gamma_parameter=0
         ):
         super().__init__()
         self.logit_scale = logit_scale
         self.loss_type = loss_type.lower()
-        self.focal_loss_gamma = focal_loss_gamma
-        self.label_smoothing_lambda = label_smoothing_lambda
+        self.loss_gamma_parameter = loss_gamma_parameter
 
         if self.logit_scale <= 0:
             raise ValueError("logit_scale must be greater than 0")
-        if self.loss_type == 'cross_entropy_loss' and self.focal_loss_gamma != 0:
-            raise ValueError("focal_loss_gamma can't be used with 'cross_entropy_loss' function")
-        elif self.loss_type != 'cross_entropy_loss' and self.focal_loss_gamma <= 0:
-            raise ValueError(f"focal_loss_gamma must be greater than 0 for use with the \'{self.loss_type}\' function")
-        if self.label_smoothing_lambda < 0 or self.label_smoothing_lambda >= 1:
-            raise ValueError("label_smoothing_lambda must be in the range [0, 1)")
+        if self.loss_type == 'cross_entropy_loss' and self.loss_gamma_parameter != 0:
+            raise ValueError("loss_gamma_parameter can't be used with 'cross_entropy_loss'")
+        elif self.loss_type == 'label_smoothed_loss' and not 0 <= self.loss_gamma_parameter < 1:
+            raise ValueError("loss_gamma_parameter must be in the range [0, 1) for use with 'label_smoothed_loss'")
+        elif self.loss_type != 'cross_entropy_loss' and self.loss_gamma_parameter <= 0:
+            raise ValueError(f"loss_gamma_parameter must be greater than 0 for use with \'{self.loss_type}\'")
 
     def forward(self, inputs):
         logits, labels = inputs
@@ -116,42 +114,48 @@ class ComputeMetrics(nn.Module):
         cross_entropy_loss_unreduced = Fast_CrossEntropyLoss.apply(
             shift_logits,
             shift_labels,
-            self.logit_scale,
-            self.label_smoothing_lambda
+            self.logit_scale
         )
         cross_entropy_loss_unreduced = cross_entropy_loss_unreduced[valid_loss]
 
-        # TODO: The way we calculate p using the exponentiated CE loss means using focal loss
-        #       at the same time as label smoothing will give *slightly* wrong results...
-        #       - This probably doesn't matter much as lambda will generally need to be very small.
         if self.loss_type == 'cross_entropy_loss':
+            # Standard cross entropy loss without label smoothing
             loss_unreduced = cross_entropy_loss_unreduced
+        elif self.loss_type == 'label_smoothed_loss':
+            # Cross entropy loss with label smoothing, see:
+            # - https://arxiv.org/pdf/1512.00567 (Section 7)
+            # - https://arxiv.org/abs/1906.02629
+            loss_unreduced = Fast_CrossEntropyLoss.apply(
+                shift_logits,
+                shift_labels,
+                self.logit_scale,
+                self.loss_gamma_parameter
+            )
         elif self.loss_type == 'focal_loss':
             # See https://arxiv.org/abs/1708.02002 (Section 3)
             p = torch.exp(-cross_entropy_loss_unreduced)
-            loss_unreduced = (1-p)**self.focal_loss_gamma * cross_entropy_loss_unreduced
+            loss_unreduced = (1-p)**self.loss_gamma_parameter * cross_entropy_loss_unreduced
         elif self.loss_type == 'focal_loss_star':
             # See https://arxiv.org/abs/1708.02002 (Appendix A/B)
             # NOTE: The use of Beta makes no sense for the multinomial case as it's invariant to translation
             loss_unreduced = Fast_CrossEntropyLoss.apply(
                 shift_logits,
                 shift_labels,
-                self.logit_scale * self.focal_loss_gamma,  # Remember to scale by original too!
-                self.label_smoothing_lambda
+                self.logit_scale * self.loss_gamma_parameter
             )
             loss_unreduced = loss_unreduced[valid_loss]
-            loss_unreduced = loss_unreduced / self.focal_loss_gamma
+            loss_unreduced = loss_unreduced / self.loss_gamma_parameter
         elif self.loss_type == 'inverse_focal_loss':
             # See "Rethinking Calibration of Deep Neural Networks: Do Not Be Afraid of Overconfidence" (Section 5.2)
             p = torch.exp(-cross_entropy_loss_unreduced)
-            loss_unreduced = (1+p)**self.focal_loss_gamma * cross_entropy_loss_unreduced
+            loss_unreduced = (1+p)**self.loss_gamma_parameter * cross_entropy_loss_unreduced
         elif self.loss_type == 'quadratic_cross_entropy_loss':
             # See "Gradient as a Foundation for Building a Loss Function" (Section III.B)
             # NOTE: This is a generalisation of their loss to arbitrary powers:
             #       - gamma=2 matches their Quadratic Cross-Entropy loss.
             #       - gamma=1 simplifies to standard Cross-Entropy loss.
             #       - gamma<1 has a similar effect to Focal Loss with gamma<1.
-            loss_unreduced = cross_entropy_loss_unreduced**self.focal_loss_gamma / self.focal_loss_gamma
+            loss_unreduced = cross_entropy_loss_unreduced**self.loss_gamma_parameter / self.loss_gamma_parameter
         else:
             raise NotImplementedError(self.loss_type)
         
@@ -173,15 +177,12 @@ class PipelineModel(nn.Module):
         self.modules_to_not_quantize = get_keys_to_not_convert(self)
         self.loader_util = LoaderUtil(config['model'], quantization_config, self.modules_to_not_quantize)
         self.loss_type = config.get('loss_type', 'cross_entropy_loss').lower()
-        self.focal_loss_gamma = config.get('focal_loss_gamma', 0)
-        self.label_smoothing_lambda = config.get('label_smoothing_lambda', 0)
+        self.loss_gamma_parameter = config.get('loss_gamma_parameter', 0)
         if is_main_process():
-            if self.focal_loss_gamma > 0:
-                print(f'Optimizing using \'{self.loss_type}\' with gamma={self.focal_loss_gamma}')
-            if self.label_smoothing_lambda > 0:
-                print(f'Optimizing using label smoothing with lambda={self.label_smoothing_lambda}')
-            if self.focal_loss_gamma > 0 and self.label_smoothing_lambda > 0:
-                print("WARNING: Using label smoothing with focal loss might be problematic (see the TODO)")
+            if self.loss_gamma_parameter == 0:
+                print(f'Optimizing using \'{self.loss_type}\'')
+            else:
+                print(f'Optimizing using \'{self.loss_type}\' with gamma={self.loss_gamma_parameter}')
             
         for name, p in self.named_parameters():
             p.original_name = name
