@@ -151,7 +151,6 @@ def evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accu
     return sum(loss) / len(loss) if len(loss) > 0 else None
 
 
-"""
 def apply_max_norm_regularization(model, config):
     # modifed from https://github.com/kohya-ss/sd-scripts/blob/main/networks/lora.py
     A_keys = []
@@ -197,7 +196,7 @@ def apply_max_norm_regularization(model, config):
         avg_norm = 0
         max_norm = 0
     return keys_scaled, avg_norm, max_norm, norms
-"""
+
 
 def apply_max_norm_regularization(model, config):
     """
@@ -333,7 +332,7 @@ def apply_max_norm_regularization(model, config):
         orthogonal Procrustes problem, but avoids explicit singular value decomposition (SVD).
     
     """
- 
+    """
     A_keys = []
     B_keys = []
     norms = []
@@ -389,7 +388,7 @@ def apply_max_norm_regularization(model, config):
         avg_norm = 0
         max_norm = 0
     return keys_scaled, avg_norm, max_norm, norms
-
+"""
 
 def parse_layers_to_transform(spec):
     parts = spec.split(',')
