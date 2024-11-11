@@ -121,6 +121,21 @@ class ComputeMetrics(nn.Module):
         if self.loss_type == 'cross_entropy_loss':
             # Standard cross entropy loss without label smoothing
             loss_unreduced = cross_entropy_loss_unreduced
+        elif self.loss_type == 'focal_loss':
+            # See https://arxiv.org/abs/1708.02002 (Section 3)
+            p = torch.exp(-cross_entropy_loss_unreduced)
+            loss_unreduced = (1-p)**self.loss_gamma_parameter * cross_entropy_loss_unreduced            
+        elif self.loss_type == 'inverse_focal_loss':
+            # See "Rethinking Calibration of Deep Neural Networks: Do Not Be Afraid of Overconfidence" (Section 5.2)
+            p = torch.exp(-cross_entropy_loss_unreduced)
+            loss_unreduced = (1+p)**self.loss_gamma_parameter * cross_entropy_loss_unreduced           
+        elif self.loss_type == 'quadratic_cross_entropy_loss':
+            # See "Gradient as a Foundation for Building a Loss Function" (Section III.B)
+            # NOTE: This is a generalisation of their loss to arbitrary powers:
+            #       - gamma=2 matches their Quadratic Cross-Entropy loss.
+            #       - gamma=1 simplifies to the standard Cross-Entropy loss.
+            #       - gamma<1 has a similar effect to Focal Loss with gamma<1.
+            loss_unreduced = cross_entropy_loss_unreduced**self.loss_gamma_parameter / self.loss_gamma_parameter            
         elif self.loss_type == 'smoothed_cross_entropy_loss':
             # Cross entropy loss with label smoothing, see:
             # - https://arxiv.org/pdf/1512.00567 (Section 7)
@@ -131,10 +146,6 @@ class ComputeMetrics(nn.Module):
                 self.logit_scale,
                 self.loss_gamma_parameter
             )
-        elif self.loss_type == 'focal_loss':
-            # See https://arxiv.org/abs/1708.02002 (Section 3)
-            p = torch.exp(-cross_entropy_loss_unreduced)
-            loss_unreduced = (1-p)**self.loss_gamma_parameter * cross_entropy_loss_unreduced
         elif self.loss_type == 'focal_loss_star':
             # See https://arxiv.org/abs/1708.02002 (Appendix A/B)
             # NOTE: The use of Beta makes no sense for the multinomial case as it's invariant to translation
@@ -145,17 +156,40 @@ class ComputeMetrics(nn.Module):
             )
             loss_unreduced = loss_unreduced[valid_loss]
             loss_unreduced = loss_unreduced / self.loss_gamma_parameter
-        elif self.loss_type == 'inverse_focal_loss':
-            # See "Rethinking Calibration of Deep Neural Networks: Do Not Be Afraid of Overconfidence" (Section 5.2)
-            p = torch.exp(-cross_entropy_loss_unreduced)
-            loss_unreduced = (1+p)**self.loss_gamma_parameter * cross_entropy_loss_unreduced
-        elif self.loss_type == 'quadratic_cross_entropy_loss':
-            # See "Gradient as a Foundation for Building a Loss Function" (Section III.B)
-            # NOTE: This is a generalisation of their loss to arbitrary powers:
-            #       - gamma=2 matches their Quadratic Cross-Entropy loss.
-            #       - gamma=1 simplifies to standard Cross-Entropy loss.
-            #       - gamma<1 has a similar effect to Focal Loss with gamma<1.
-            loss_unreduced = cross_entropy_loss_unreduced**self.loss_gamma_parameter / self.loss_gamma_parameter
+        elif self.loss_type == 'simplified_gem_loss':
+            # See https://arxiv.org/abs/2408.16673 (Appendix A)
+            # NOTE: This is a simplified version of their "GEM-Linear" method.
+            #       - By focusing on the true class and not summing over all classes, the loss simplifies to:
+            #         - Starting from the general GEM loss:
+            #               loss = -sum_c [ q_c * (log p_t - log p_c) ]
+            #         - Simplify inside the sum:
+            #               loss = -sum_c [ q_c * log(p_t / p_c) ]
+            #         - Split the sum:
+            #               loss = -log(p_t) * sum_c [ q_c ] + sum_c [ q_c * log(p_c) ]
+            #         - Since sum_c [ q_c ] = 1:
+            #               loss = -log(p_t) + sum_c [ q_c * log(p_c) ]
+            #         - Approximate E_q [ log(p_c) ] by focusing on the true class:
+            #               E_q [ log(p_c) ] ≈ q_t * log(p_t)
+            #         - Loss becomes:
+            #               loss ≈ -log(p_t) + q_t * log(p_t)
+            #                    ≈ (1 - q_t) * -log(p_t)
+            #         - Since q_t = CE_loss with scaled logits, and -log(p_t) = standard CE_loss:
+            #               approximate_gem_loss = (1 - q_t) * CE_loss
+            #       - This formula combines ideas from both Focal Loss and Focal Loss*:
+            #           - Sample Re-weighting: The factor (1 - q) adjusts the loss based on confidence.
+            #           - Logit Scaling: Scaling logits sharpens probabilities, similar to adjusting gamma in focal loss.
+            #       - When gamma=1 (no scaling), q = p_t, and we recover the standard focal loss with gamma=1:
+            #             loss_unreduced = (1 - p_t) * (-log(p_t)) = - (1 - p_t) * log(p_t)
+            #       - Increasing gamma (>1) scales the logits more, increasing the emphasis on misclassified samples.
+            #       - The weighting function (1 - q) is reverse sigmoidal, upweighting low-confidence samples less
+            #         aggressively than standard Focal Loss.      
+            peaked_loss_unreduced = Fast_CrossEntropyLoss.apply(
+                shift_logits,
+                shift_labels,
+                self.logit_scale * self.loss_gamma_parameter
+            )
+            q = torch.exp(-peaked_loss_unreduced)
+            loss_unreduced = (1-q) * cross_entropy_loss_unreduced
         else:
             raise NotImplementedError(self.loss_type)
         
