@@ -23,16 +23,16 @@
 #   https://arxiv.org/abs/1708.02002 (Appendix A and B).
 #
 # Added support for Label Smoothing:
-# - The smoothed labels are: y_smooth = (1 - gamma) * y + gamma / |V|
+# - The smoothed labels are: y_smooth = (1 - gamma) * y + gamma / (|V| - 1)
 # - The full loss with label smoothing, where U ~ Uniform(1 / |V|):
 #       Loss = CE_loss(y_smooth, p)
 #            = (1 - gamma) * H(y, p) + gamma * H(U, p)
 #            = (1 - gamma) * (-Σ y_i * log(p_i)) + gamma * (-Σ u_i * log(p_i))
 # - For efficiency, we use the approximation:
-#       Loss ≈ logsumexp - (1 - gamma) * z_target + gamma * log(|V|)
+#       Loss ≈ logsumexp - (1 - gamma) * z_target + gamma * log(|V| - 1)
 #   This approximation avoids explicitly summing over all vocabulary tokens
 #   for the uniform term and maintains similar optimization behaviour since
-#   the value log(|V|) is constant with respect to the parameters.
+#   the value log(|V| - 1) is constant with respect to the parameters.
 # - The backward pass computes the gradients as:
 #       dL/dz_i = p_i - y_smooth_i
 #   where y_smooth_i includes the label smoothing adjustments.
@@ -86,18 +86,18 @@ def _cross_entropy_forward(
             z_i = s * z_i
                 
         With label smoothing, the targets y_i are modified:
-            y_target = (1 - gamma) for the true label
-            y_i = gamma / |V|   for all other labels i != t
+            y_target = (1 - gamma)    for the true label
+            y_i = gamma / (|V| - 1)   for all other labels i != t
         
         Instead of computing the full loss:
             Loss = (1-gamma)*(-log p_t) + gamma*(-Σ (1/|V|)*log p_i)
         
         We use:
-            Loss ≈ logsumexp - (1-gamma)*z_target + gamma*log(|V|)
+            Loss ≈ logsumexp - (1-gamma)*z_target + gamma*log(|V| - 1)
         
         This avoids having to explicitly sum over the full vocabulary for the uniform
         distribution term,while maintaining equivalent optimization behaviour since
-        the value of log(|V|) is constant w.r.t the parameters.
+        the value of log(|V| - 1) is constant w.r.t the parameters.
     """
     row_idx = tl.program_id(0)
     logits_ptr    += row_idx * logits_row_stride.to(tl.int64)
@@ -121,7 +121,7 @@ def _cross_entropy_forward(
         if DO_LOGIT_SCALING:
             logit_target = LOGIT_SCALE_FACTOR * logit_target
         if DO_LABEL_SMOOTHING:
-            loss = logsumexp - (1.0 - SMOOTHING_GAMMA) * logit_target + SMOOTHING_GAMMA * tl.log(float(VOCAB_SIZE))
+            loss = logsumexp - (1.0 - SMOOTHING_GAMMA) * logit_target + SMOOTHING_GAMMA * tl.log(float(VOCAB_SIZE - 1))
         else:
             loss = logsumexp - logit_target
     else:
@@ -169,7 +169,7 @@ def _chunked_cross_entropy_forward(
             Loss = logsumexp_total - z_target
         
         If label smoothing is applied:
-            Loss = logsumexp_total - (1 - gamma) * z_target + gamma * log(|V|)
+            Loss = logsumexp_total - (1 - gamma) * z_target + gamma * log(|V| - 1)
     """
     row_idx   = tl.program_id(0)
     chunk_idx = tl.program_id(1)
@@ -196,7 +196,7 @@ def _chunked_cross_entropy_forward(
             if DO_LOGIT_SCALING:
                 logit_target = LOGIT_SCALE_FACTOR * logit_target
             if DO_LABEL_SMOOTHING:
-                loss = - (1.0 - SMOOTHING_GAMMA) * logit_target + SMOOTHING_GAMMA * tl.log(float(VOCAB_SIZE))
+                loss = - (1.0 - SMOOTHING_GAMMA) * logit_target + SMOOTHING_GAMMA * tl.log(float(VOCAB_SIZE - 1))
             else:
                 loss = - logit_target
         else:
@@ -234,7 +234,7 @@ def _cross_entropy_backward(
             - For the target class (i = target):
                 y_i = 1 - gamma
             - For other classes:
-                y_i = gamma / (V - 1)
+                y_i = gamma / (|V| - 1)
         
         Thus, the gradient becomes:
             dL/dz_i = p_i - y_i
@@ -267,7 +267,7 @@ def _cross_entropy_backward(
         d_logits = tl.where(
             col_offsets == label_idx,
             p - (1.0 - SMOOTHING_GAMMA),
-            p - SMOOTHING_GAMMA / float(VOCAB_SIZE)
+            p - SMOOTHING_GAMMA / float(VOCAB_SIZE - 1)
         )
     else:
         d_logits = tl.where(
