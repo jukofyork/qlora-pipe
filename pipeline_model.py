@@ -93,8 +93,8 @@ class ComputeMetrics(nn.Module):
             raise ValueError("logit_scale must be greater than 0")
         if self.loss_type == 'cross_entropy_loss' and self.loss_gamma_parameter != 0:
             raise ValueError("loss_gamma_parameter can't be used with 'cross_entropy_loss'")
-        elif self.loss_type == 'label_smoothed_loss' and not 0 <= self.loss_gamma_parameter < 1:
-            raise ValueError("loss_gamma_parameter must be in the range [0, 1) for use with 'label_smoothed_loss'")
+        elif self.loss_type == 'smoothed_cross_entropy_loss' and not 0 <= self.loss_gamma_parameter < 1:
+            raise ValueError("loss_gamma_parameter must be in the range [0, 1) for use with 'smoothed_cross_entropy_loss'")
         elif self.loss_type != 'cross_entropy_loss' and self.loss_gamma_parameter <= 0:
             raise ValueError(f"loss_gamma_parameter must be greater than 0 for use with \'{self.loss_type}\'")
 
@@ -121,7 +121,7 @@ class ComputeMetrics(nn.Module):
         if self.loss_type == 'cross_entropy_loss':
             # Standard cross entropy loss without label smoothing
             loss_unreduced = cross_entropy_loss_unreduced
-        elif self.loss_type == 'label_smoothed_loss':
+        elif self.loss_type == 'smoothed_cross_entropy_loss':
             # Cross entropy loss with label smoothing, see:
             # - https://arxiv.org/pdf/1512.00567 (Section 7)
             # - https://arxiv.org/abs/1906.02629
