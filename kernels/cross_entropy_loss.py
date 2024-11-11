@@ -28,14 +28,13 @@
 #       Loss = CE_loss(y_smooth, p)
 #            = (1 - gamma) * H(y, p) + gamma * H(U, p)
 #            = (1 - gamma) * (-Σ y_i * log(p_i)) + gamma * (-Σ u_i * log(p_i))
-# - For efficiency, we use the approximation:
+# - For efficiency during the forward pass, we use the approximation:
 #       Loss ≈ logsumexp - (1 - gamma) * z_target + gamma * log(|V| - 1)
 #   This approximation avoids explicitly summing over all vocabulary tokens
-#   for the uniform term and maintains similar optimization behaviour since
-#   the value log(|V| - 1) is constant with respect to the parameters.
-# - The backward pass computes the gradients as:
+#   for the uniform term in the forward pass.
+# - The backward pass computes the gradients without any approximation:
 #       dL/dz_i = p_i - y_smooth_i
-#   where y_smooth_i includes the label smoothing adjustments.
+#   where y_smooth_i includes the full label smoothing adjustments.
 
 import triton
 import triton.language as tl
