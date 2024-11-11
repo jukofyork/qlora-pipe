@@ -150,7 +150,7 @@ def evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accu
         tb_writer.add_scalar('eval/eval_time_sec', duration, step)
     return sum(loss) / len(loss) if len(loss) > 0 else None
 
-
+"""
 def apply_max_norm_regularization(model, config):
     # modifed from https://github.com/kohya-ss/sd-scripts/blob/main/networks/lora.py
     A_keys = []
@@ -196,7 +196,7 @@ def apply_max_norm_regularization(model, config):
         avg_norm = 0
         max_norm = 0
     return keys_scaled, avg_norm, max_norm, norms
-
+"""
 
 def apply_max_norm_regularization(model, config):
     """
@@ -207,7 +207,7 @@ def apply_max_norm_regularization(model, config):
     **Mathematical Justification:**
     
     - **Objective:**
-      - Control the deviation of C = I + A Bᵗ from being orthogonal by limiting the Frobenius norm of E = CᵗC - I.
+      - Control the deviation of C = I + BA from being orthogonal by limiting the Frobenius norm of E = CᵗC - I.
     
     - **Relation to Singular Values:**
       - The squared Frobenius norm of E relates to the singular values (σₖ) of C:
@@ -220,7 +220,7 @@ def apply_max_norm_regularization(model, config):
       - Computing ||E||_F exactly is computationally intensive for large matrices.
       - We use an approximation involving leading second-order terms:
       
-        E_norm² ≈ 2 ||AᵗB||_F² + 2 trace((AᵗA)(BᵗB))
+        E_norm² ≈ 2 ||AB||_F² + 2 Tr(AAᵗ * BᵗB) 
       
       - This approximation operates on small k x k matrices, making it efficient for large n (the dimension 
         of A and B) when k ≪ n.
@@ -332,7 +332,6 @@ def apply_max_norm_regularization(model, config):
         orthogonal Procrustes problem, but avoids explicit singular value decomposition (SVD).
     
     """
-    """
     A_keys = []
     B_keys = []
     norms = []
@@ -346,22 +345,18 @@ def apply_max_norm_regularization(model, config):
             B_keys.append(key.replace('lora_A', 'lora_B'))
 
     for i in range(len(A_keys)):
-        A = state_dict[A_keys[i]]
-        B = state_dict[B_keys[i]]
+        A = state_dict[A_keys[i]]  # k x n matrix
+        B = state_dict[B_keys[i]]  # n x k matrix
         
-        # Compute approximate Frobenius norm of E = CᵗC - I
-        # Scale A and B by lora_scale to account for any scaling in the low-rank update
-        AtB = lora_scale * (A.T @ B)  # k x k matrix
-        AtB_norm_sq = torch.norm(AtB, p='fro') ** 2  # Scalar       
-        
-        AtA = lora_scale * (A.T @ A)  # k x k matrix
+        # Compute approximate Frobenius norm of E = CᵗC - I, where C = BA (n x n matrix):
+        # Using: ||CᵗC - I||_F² = 2 * ||AB||_F² + 2 * Tr(AAᵗ * BᵗB) + higher order terms
+        AB = lora_scale * (A @ B)     # k x k matrix
+        AB_norm_sq = torch.norm(AB, p='fro') ** 2
+        AAt = lora_scale * (A @ A.T)  # k x k matrix
         BtB = lora_scale * (B.T @ B)  # k x k matrix
-        trace_AtA_BtB = torch.trace(AtA @ BtB)  # Scalar
-        
-        # Approximate E_norm_sq using both leading terms
-        # E_norm_sq ≈ 2 * ||AᵗB||_F² + 2 * Tr(AᵗA * BᵗB)
-        E_norm_sq_approx = 2 * AtB_norm_sq + 2 * trace_AtA_BtB
-        E_norm = torch.sqrt(E_norm_sq_approx)           
+        trace_AAt_BtB = torch.trace(AAt @ BtB)
+        E_norm_sq_approx = 2 * AB_norm_sq + 2 * trace_AAt_BtB
+        E_norm = torch.sqrt(E_norm_sq_approx)
 
         if 'scale_weight_norms' in config:
             max_norm = config['scale_weight_norms']
@@ -388,7 +383,6 @@ def apply_max_norm_regularization(model, config):
         avg_norm = 0
         max_norm = 0
     return keys_scaled, avg_norm, max_norm, norms
-"""
 
 def parse_layers_to_transform(spec):
     parts = spec.split(',')
