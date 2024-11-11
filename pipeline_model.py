@@ -146,6 +146,7 @@ class ComputeMetrics(nn.Module):
                 self.logit_scale,
                 self.loss_gamma_parameter
             )
+            loss_unreduced = loss_unreduced[valid_loss]
         elif self.loss_type == 'focal_loss_star':
             # See https://arxiv.org/abs/1708.02002 (Appendix A/B)
             # NOTE: The use of Beta makes no sense for the multinomial case as it's invariant to translation
@@ -188,6 +189,7 @@ class ComputeMetrics(nn.Module):
                 shift_labels,
                 self.logit_scale * self.loss_gamma_parameter
             )
+            peaked_loss_unreduced = peaked_loss_unreduced[valid_loss]
             q = torch.exp(-peaked_loss_unreduced)
             loss_unreduced = (1-q) * cross_entropy_loss_unreduced
         else:
