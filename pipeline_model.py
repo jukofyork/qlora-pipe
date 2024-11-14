@@ -86,7 +86,7 @@ def compute_orthogonality_regularization(model, config):
             AB = lora_scale * A @ B
             AB_norm_sq = torch.norm(AB, p='fro') ** 2
             AAt = lora_scale * (A @ A.T)
-            BtB = lora_scale * (B @ B.T)
+            BtB = lora_scale * (B.T @ B)
             trace_AAt_BtB = torch.trace(AAt @ BtB)
             E_norm_sq_approx = 2 * AB_norm_sq + 2 * trace_AAt_BtB
             E_norm_approx = torch.sqrt(E_norm_sq_approx)
