@@ -44,11 +44,11 @@ def initialize(args=None,
 
     return engine, engine.optimizer
 
-def compute_orthogonality_regularization(model, config):
+def compute_orthogonality_regularization(model):
     A_keys = []
     B_keys = []
     norms = []
-    lora_scale = config['lora_alpha'] / config['lora_rank']
+    lora_scale = 1.0  ## TODO: Pass in same way as orthogonality_lambda via ComputeMetrics
 
     state_dict = model.state_dict()
     for key in state_dict.keys():
@@ -292,31 +292,12 @@ class CustomPipelineEngine(PipelineEngine):
             else:
                 # Some models just return loss from forward()
                 losses = outputs
-                
-            # Debug inspection
-            print("\nEngine inspection:")
-            print("self.module type:", type(self.module))
-            print("self.module attributes:", dir(self.module))
-            
-            print("\nModules inspection:")
-            print("Modules:", self.module._modules.keys())
-            if len(self.module._modules) > 0:
-                first_module = next(iter(self.module._modules.values()))
-                print("First module type:", type(first_module))
-                print("First module attributes:", dir(first_module))
-            
-            print("\nParameters inspection:")
-            print("Parameters:", self.module._parameters.keys())
 
             # Add orthogonality regularization
-            if ('orthogonality_lambda' in self.module.train_config and
-                'lora_alpha' in self.module.train_config and
-                'lora_rank' in self.module.train_config):
-                #print(f"Config values: lambda={self.module.train_config['orthogonality_lambda']}, "
-                #      f"alpha={self.module.train_config['lora_alpha']}, "
-                #      f"rank={self.module.train_config['lora_rank']}")
-                avg_norm = compute_orthogonality_regularization(self.module, self.module.train_config)
-                orthogonality_lambda = self.module.train_config['orthogonality_lambda']
+            orthogonality_lambda = getattr(self.module._layer_specs[-1], 'orthogonality_lambda', 0)
+            if (orthogonality_lambda > 0):
+                print(f"orthogonality_lambda={orthogonality_lambda}")
+                avg_norm = compute_orthogonality_regularization(self.module)
                 if isinstance(losses, torch.Tensor):
                     losses = losses + orthogonality_lambda * avg_norm
                 else:
