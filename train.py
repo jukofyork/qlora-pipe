@@ -656,7 +656,7 @@ if __name__ == '__main__':
         train_dataloader.sync_epoch()
         if lora_config is not None:
             keys_scaled, avg_norm, max_norm, norms = apply_max_norm_regularization(pipeline_model, config)
-            avg_ortho_norm, max_ortho_norm, ortho_norms = compute_orthogonality_norms(pipeline_model, config)
+            avg_ortho_norm, max_ortho_norm, ortho_norms = compute_orthogonality_norms(pipeline_model) #, config)
 
         epoch = saver.process_epoch(epoch, step)
         if epoch is None:
