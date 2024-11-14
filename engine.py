@@ -295,9 +295,7 @@ class CustomPipelineEngine(PipelineEngine):
 
             orthogonality_lambda = 0
             if hasattr(self.module, '_layer_specs'):
-                last_layer = self.module._layer_specs[-1]  # Get the last layer spec
-                if isinstance(last_layer, LayerSpec) and last_layer.typename == ComputeMetrics:
-                    orthogonality_lambda = last_layer.module_kwargs.get('orthogonality_lambda', 0)
+                orthogonality_lambda = self.module._layer_specs[-1].module_kwargs.get('orthogonality_lambda', 0)
             print(f"orthogonality_lambda = {orthogonality_lambda}")
                     
             # Add orthogonality regularization
