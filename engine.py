@@ -293,10 +293,31 @@ class CustomPipelineEngine(PipelineEngine):
                 # Some models just return loss from forward()
                 losses = outputs
 
+            # Debug model inspection
+            print("\nModel inspection:")
+            print("Model type:", type(model))
+            print("Model dir:", dir(model))
+            if hasattr(model, 'train_config'):
+                print("Model train_config found:", {
+                    'lambda': model.train_config.get('orthogonality_lambda'),
+                    'alpha': model.train_config.get('lora_alpha'),
+                    'rank': model.train_config.get('lora_rank')
+                })
+            
+            print("\nModel parameters inspection:")
+            print("Model parameters type:", type(model_parameters))
+            if model_parameters is not None:
+                print("Number of parameter groups:", len(model_parameters))
+                for i, group in enumerate(model_parameters):
+                    print(f"Group {i} keys:", group.keys())
+
             # Add orthogonality regularization
             if ('orthogonality_lambda' in self.module.train_config and
                 'lora_alpha' in self.module.train_config and
                 'lora_rank' in self.module.train_config):
+                #print(f"Config values: lambda={self.module.train_config['orthogonality_lambda']}, "
+                #      f"alpha={self.module.train_config['lora_alpha']}, "
+                #      f"rank={self.module.train_config['lora_rank']}")
                 avg_norm = compute_orthogonality_regularization(self.module, self.module.train_config)
                 orthogonality_lambda = self.module.train_config['orthogonality_lambda']
                 if isinstance(losses, torch.Tensor):
