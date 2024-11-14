@@ -83,7 +83,7 @@ def compute_orthogonality_regularization(model, config):
             B = state_dict[B_keys[i]]
     
             # Compute approximate Frobenius norm of E = CᵗC - I
-            AB = lora_scale * (A @ B.T)
+            AB = lora_scale * A @ B
             AB_norm_sq = torch.norm(AB, p='fro') ** 2
             AAt = lora_scale * (A @ A.T)
             BtB = lora_scale * (B @ B.T)
