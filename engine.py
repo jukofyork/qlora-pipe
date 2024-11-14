@@ -296,7 +296,7 @@ class CustomPipelineEngine(PipelineEngine):
             orthogonality_lambda = 0
             if hasattr(self.module, '_layer_specs'):
                 orthogonality_lambda = self.module._layer_specs[-1].module_kwargs.get('orthogonality_lambda', 0)
-            print(f"orthogonality_lambda = {orthogonality_lambda}")
+            #print(f"orthogonality_lambda = {orthogonality_lambda}")
                     
             # Add orthogonality regularization
             if (orthogonality_lambda > 0):
