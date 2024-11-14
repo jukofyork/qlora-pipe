@@ -298,7 +298,7 @@ class CustomPipelineEngine(PipelineEngine):
         
             # Add orthogonality regularization
             avg_norm = compute_orthogonality_regularization(self.module)
-            orthogonality_lambda = self.module.lora_config.get('orthogonality_lambda', 0.0)
+            orthogonality_lambda = 0.1
             if isinstance(losses, torch.Tensor):
                 losses = losses + orthogonality_lambda * avg_norm
             else:
