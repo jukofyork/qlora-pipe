@@ -217,6 +217,49 @@ def apply_max_norm_regularization(model, config):
     return keys_scaled, avg_norm, max_norm, norms
 
 
+# NOTE: Later, this should also incorporate the lora_scale like this:
+#       `lora_scale = config['lora_alpha'] / config['lora_rank']
+#       AB = lora_scale * A @ B
+#       AAt = lora_scale * (A @ A.T)
+#       BtB = lora_scale * (B.T @ B)
+def compute_orthogonality_norms(model):
+    norms = []
+    A_keys = []
+    B_keys = []
+    state_dict = model.state_dict()
+    for key in state_dict.keys():
+        if 'lora_A' in key:
+            A_keys.append(key)
+            B_keys.append(key.replace('lora_A', 'lora_B'))
+
+    for i in range(len(A_keys)):
+        A = state_dict[A_keys[i]]  # k x n
+        B = state_dict[B_keys[i]]  # n x k
+
+        # Compute approximate Frobenius norm of E = CᵗC - I
+        AB = A @ B     # k x k
+        AB_norm_sq = torch.norm(AB, p='fro') ** 2
+        AAt = A @ A.T  # k x k
+        BtB = B.T @ B  # k x k
+        trace_AAt_BtB = torch.trace(AAt @ BtB)
+        E_norm_sq_approx = 2 * AB_norm_sq + 2 * trace_AAt_BtB
+        E_norm_approx = torch.sqrt(E_norm_sq_approx)
+        norms.append(E_norm_approx)
+    
+    if len(norms) > 0:
+        norms = torch.stack(norms)
+        if torch.any(torch.isnan(norms)):
+            raise RuntimeError('NaN detected in norms, probably some/all weights are NaN')
+        avg_norm = torch.mean(norms)
+        max_norm = torch.max(norms)
+    else:
+        device = next(model.parameters()).device
+        avg_norm = torch.tensor(0.0, device=device)
+        max_norm = torch.tensor(0.0, device=device)
+        norms = torch.tensor([], device=device)
+    return avg_norm, max_norm, norms
+
+
 def parse_layers_to_transform(spec):
     parts = spec.split(',')
     result = []
@@ -613,6 +656,7 @@ if __name__ == '__main__':
         train_dataloader.sync_epoch()
         if lora_config is not None:
             keys_scaled, avg_norm, max_norm, norms = apply_max_norm_regularization(pipeline_model, config)
+            avg_ortho_norm, max_ortho_norm, ortho_norms = compute_orthogonality_norms(pipeline_model, config)
 
         epoch = saver.process_epoch(epoch, step)
         if epoch is None:
@@ -627,6 +671,9 @@ if __name__ == '__main__':
                 tb_writer.add_scalar('train/avg_weight_norm', avg_norm, step)
                 tb_writer.add_scalar('train/max_weight_norm', max_norm, step)
                 tb_writer.add_histogram('train/weight_norm_hist', norms, step)
+                tb_writer.add_scalar('train/avg_ortho_norm', avg_ortho_norm, step)
+                tb_writer.add_scalar('train/max_ortho_norm', max_ortho_norm, step)
+                tb_writer.add_histogram('train/ortho_norm_hist', ortho_norms, step)
             tb_writer.add_scalar('train/epoch', step/steps_per_epoch, step)
 
         if step % config['eval_steps'] == 0:
