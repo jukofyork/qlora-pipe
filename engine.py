@@ -296,6 +296,10 @@ class CustomPipelineEngine(PipelineEngine):
                 # Some models just return loss from forward()
                 losses = outputs
         
+            print(hasattr(self.module, 'peft_config'))
+                if hasattr(self.module, 'peft_config'):
+                    print(self.module.peft_config)
+
             # Add orthogonality regularization
             avg_norm = compute_orthogonality_regularization(self.module)
             orthogonality_lambda = 0.1
