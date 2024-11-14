@@ -159,7 +159,7 @@ def evaluate_single(model_engine, name, eval_dataloader, tb_writer, step, eval_g
     # Compute regularization term
     regularization_loss = 0.0
     if lora_config is not None:
-        avg_ortho_norm, max_ortho_norm, ortho_norms = compute_orthogonality_regularization(pipeline_model.module, config)
+        avg_ortho_norm, max_ortho_norm, ortho_norms = compute_orthogonality_regularization(pipeline_model, config)
         orthogonality_lambda = config.get('orthogonality_lambda', 0.0)
         regularization_loss = orthogonality_lambda * avg_ortho_norm
 
@@ -224,6 +224,7 @@ def compute_orthogonality_regularization(model, config):
         device = next(model.parameters()).device
         avg_norm = torch.tensor(0.0, device=device)
         max_norm = torch.tensor(0.0, device=device)
+        norms = torch.tensor([], device=device)
     return avg_norm, max_norm, norms
 
 
@@ -678,7 +679,7 @@ if __name__ == '__main__':
         # Compute orthogonality regularization
         if lora_config is not None and 'eval_before_first_step' in config:
              # TODO: gather the weight norms across all stages in the pipelined model, not just the first.
-            avg_ortho_norm, max_ortho_norm, ortho_norms = compute_orthogonality_regularization_local(pipeline_model.module, config)
+            avg_ortho_norm, max_ortho_norm, ortho_norms = compute_orthogonality_regularization_local(pipeline_model, config)
             orthogonality_lambda = config.get('orthogonality_lambda', 0.0)
             loss = loss + orthogonality_lambda * avg_ortho_norm
     
