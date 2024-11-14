@@ -44,6 +44,40 @@ def initialize(args=None,
 
     return engine, engine.optimizer
 
+"""
+Orthogonality regularization for LoRA matrices A (k x n) and B (n x k):
+- Penalizes when BA (n x n) deviates from being an orthogonal transformation
+- Uses squared Frobenius norm ||CCᵗ - I||²_F where C = BA
+- Split into two interpretable terms that can have separate lambda weights:
+  1. ||AB||²_F - Cross-covariance term penalizing scaling
+     - Measures magnitude/energy of the k x k transformation AB
+     - Large values indicate BA is scaling vectors up/down too much
+  2. Tr(AAᵗBᵗB) - Covariance alignment term penalizing skewing  
+     - AAᵗ and BᵗB are k x k covariance matrices
+     - Their product/trace measures non-orthogonal rotation effects
+     - Large values mean BA introduces unwanted shearing/skewing
+
+We use squared norm (not sqrt) because:
+- Matches L2/weight decay convention of using squared penalties
+- Gives smoother gradients (sqrt derivative has 1/sqrt term)
+- Penalizes larger deviations more strongly
+- More stable optimization behavior
+
+Mathematical approximation:
+The actual regularization we want is ||BABᵗA - I||²_F for the n x n matrix BA
+But computing this directly requires O(n³) or O(n⁴) operations
+Instead we exploit that BA has rank at most k (k << n) and approximate using
+k x k matrices AB and covariance terms AAᵗ, BᵗB
+This works because:
+- BA's effect is mainly in the k-dimensional subspace spanned by A,B
+- The approximation captures scaling/rotation in this important subspace
+- Outside this subspace BA≈0 anyway due to low rank
+- Empirically validated to effectively regularize orthogonality
+- Computationally feasible since k is small (e.g. k=64 vs n=8192)
+
+The two penalty terms may need separate scaling factors to be comparable
+magnitude-wise before applying different lambda weights for scaling vs skewing.
+"""
 def compute_orthogonality_regularization(model):
     A_keys = []
     B_keys = []
@@ -67,8 +101,8 @@ def compute_orthogonality_regularization(model):
         BtB = lora_scale * (B.T @ B)  # k x k
         trace_AAt_BtB = torch.trace(AAt @ BtB)
         E_norm_sq_approx = 2 * AB_norm_sq + 2 * trace_AAt_BtB
-        E_norm_approx = torch.sqrt(E_norm_sq_approx)
-        norms.append(E_norm_approx)
+        # Use the squared value for regulariser!
+        norms.append(E_norm_sq_approx)
     
     if len(norms) > 0:
         norms = torch.stack(norms)
