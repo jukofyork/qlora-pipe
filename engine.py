@@ -298,22 +298,15 @@ class CustomPipelineEngine(PipelineEngine):
             print("self.module type:", type(self.module))
             print("self.module attributes:", dir(self.module))
             
-            if hasattr(self.module, 'model'):
-                print("\nself.module.model type:", type(self.module.model))
-                print("self.module.model attributes:", dir(self.module.model))
-            
-            if hasattr(self, 'model'):
-                print("\nself.model type:", type(self.model))
-                print("self.model attributes:", dir(self.model))
+            print("\nModules inspection:")
+            print("Modules:", self.module._modules.keys())
+            if len(self.module._modules) > 0:
+                first_module = next(iter(self.module._modules.values()))
+                print("First module type:", type(first_module))
+                print("First module attributes:", dir(first_module))
             
             print("\nParameters inspection:")
-            print("self.module.parameters() type:", type(self.module.parameters()))
-            if hasattr(self, 'model_parameters'):
-                print("self.model_parameters type:", type(self.model_parameters))
-                if self.model_parameters is not None:
-                    print("Number of parameter groups:", len(self.model_parameters))
-                    for i, group in enumerate(self.model_parameters):
-                        print(f"Group {i} keys:", group.keys())
+            print("Parameters:", self.module._parameters.keys())
 
             # Add orthogonality regularization
             if ('orthogonality_lambda' in self.module.train_config and
