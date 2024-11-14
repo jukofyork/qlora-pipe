@@ -64,6 +64,34 @@ def top_k_accuracy(logits, labels, k_list, ignore_index=-100):
         accuracies.append(torch.any(top_k_predictions[:, :k] == labels, dim=-1).to(torch.float32).mean())
     return accuracies
 
+def compute_orthogonality_regularization(model, config):
+    lora_scale = config['lora_alpha'] / config['lora_rank']
+    norms = []
+    for name, module in model.named_modules():
+        if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
+            A = module.lora_A.weight
+            B = module.lora_B.weight
+
+            # Compute approximate Frobenius norm of E = CᵗC - I
+            AB = lora_scale * (A @ B.T)
+            AB_norm_sq = torch.norm(AB, p='fro') ** 2
+            AAt = lora_scale * (A @ A.T)
+            BtB = lora_scale * (B @ B.T)
+            trace_AAt_BtB = torch.trace(AAt @ BtB)
+            E_norm_sq_approx = 2 * AB_norm_sq + 2 * trace_AAt_BtB
+            E_norm_approx = torch.sqrt(E_norm_sq_approx)
+            norms.append(E_norm_approx)
+
+    if len(norms) > 0:
+        norms = torch.stack(norms)
+        if torch.any(torch.isnan(norms)):
+            raise RuntimeError('NaN detected in norms, probably some/all weights are NaN')
+        avg_norm = torch.mean(norms)
+        max_norm = torch.max(norms)
+    else:
+        avg_norm = torch.tensor(0.0, device=next(model.parameters()).device)
+        max_norm = torch.tensor(0.0, device=next(model.parameters()).device)
+    return avg_norm, max_norm, norms
 
 class LayerSpec(ds_pipe_module.LayerSpec):
     def __init__(self, typename, *module_args, **module_kwargs):
@@ -81,11 +109,15 @@ class LayerSpec(ds_pipe_module.LayerSpec):
 class ComputeMetrics(nn.Module):
     def __init__(
             self,
+            model,
+            config,
             logit_scale=1.0,
             loss_type='cross_entropy_loss',
             focal_loss_gamma=0
         ):
         super().__init__()
+        self.model = model
+        self.config = config
         self.logit_scale = logit_scale
         self.loss_type = loss_type.lower()
         self.focal_loss_gamma = focal_loss_gamma
@@ -156,8 +188,15 @@ class ComputeMetrics(nn.Module):
             mcfaddens_pseudo_r2 = 1 - (log_likelihood / log_vocab_size)
             accuracies = top_k_accuracy(shift_logits, shift_labels, k_list=[1, 5, 20])
         loss = loss_unreduced.mean()
+        
+        # Add orthogonality regularization
+        avg_ortho_norm, max_ortho_norm, ortho_norms = compute_orthogonality_regularization(self.model, self.config)
+        if 'orthogonality_lambda' in config:
+            orthogonality_lambda = self.config['orthogonality_lambda']
+            loss = loss + orthogonality_lambda * avg_ortho_norm
+                
         loss_unreduced = loss_unreduced.detach()
-        return loss, loss_unreduced, entropy, normalised_entropy, log_likelihood, mcfaddens_pseudo_r2, *accuracies
+        return loss, loss_unreduced, entropy, normalised_entropy, log_likelihood, mcfaddens_pseudo_r2, *accuracies, avg_ortho_norm, max_ortho_norm, ortho_norms
 
 
 class PipelineModel(nn.Module):
