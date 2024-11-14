@@ -45,6 +45,46 @@ def initialize(args=None,
     return engine, engine.optimizer
 
 
+def compute_orthogonality_regularization(model):
+    norms = []
+    A_keys = []
+    B_keys = []
+    lora_scale = 1.0 #config['lora_alpha'] / config['lora_rank']
+
+    state_dict = model.state_dict()
+    for key in state_dict.keys():
+        if 'lora_A' in key:
+            A_keys.append(key)
+            B_keys.append(key.replace('lora_A', 'lora_B'))
+
+    for i in range(len(A_keys)):
+        A = state_dict[A_keys[i]]
+        B = state_dict[B_keys[i]]
+
+        # Compute approximate Frobenius norm of E = CᵗC - I
+        AB = lora_scale * A @ B
+        AB_norm_sq = torch.norm(AB, p='fro') ** 2
+        AAt = lora_scale * (A @ A.T)
+        BtB = lora_scale * (B.T @ B)
+        trace_AAt_BtB = torch.trace(AAt @ BtB)
+        E_norm_sq_approx = 2 * AB_norm_sq + 2 * trace_AAt_BtB
+        E_norm_approx = torch.sqrt(E_norm_sq_approx)
+        norms.append(E_norm_approx)
+    
+if len(norms) > 0:
+    norms = torch.stack(norms)
+    if torch.any(torch.isnan(norms)):
+        raise RuntimeError('NaN detected in norms, probably some/all weights are NaN')
+    avg_norm = torch.mean(norms)
+    max_norm = torch.max(norms)
+else:
+    device = next(model.parameters()).device
+    avg_norm = torch.tensor(0.0, device=device)
+    max_norm = torch.tensor(0.0, device=device)
+    norms = torch.tensor([], device=device)
+return avg_norm, max_norm, norms
+
+
 class CustomPipelineEngine(PipelineEngine):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -72,6 +112,14 @@ class CustomPipelineEngine(PipelineEngine):
         # Actual training loss is always the first item.
         self.agg_train_loss = agg_losses[0].mean()
 
+        # Add orthogonality regularization if configured
+        if hasattr(self.module, 'lora_config') and self.module.lora_config is not None:
+            avg_ortho_norm, max_ortho_norm, _ = compute_orthogonality_regularization(self.module)
+            orthogonality_lambda = self.module.lora_config.get('orthogonality_lambda', 0.0)
+            
+            # Add regularization to the aggregated loss
+            self.agg_train_loss = self.agg_train_loss + orthogonality_lambda * avg_ortho_norm
+    
         self.timers(TRAIN_BATCH_TIMER).stop()
 
         if self.global_steps % self.steps_per_print() == 0:

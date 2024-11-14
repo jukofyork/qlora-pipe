@@ -66,8 +66,8 @@ def get_most_recent_run_dir(output_dir):
     return list(sorted(glob.glob(os.path.join(output_dir, '*'))))[-1]
 
 
-def write_metrics(tb_writer, prefix, metrics, loss, step):
-    #loss = metrics[0].mean().item()
+def write_metrics(tb_writer, prefix, metrics, step):
+    loss = metrics[0].mean().item()
     tb_writer.add_scalar(f'{prefix}/loss', loss, step)
 
     if len(metrics) > 1:
@@ -122,21 +122,14 @@ def write_metrics(tb_writer, prefix, metrics, loss, step):
         tb_writer.add_scalar(f'{prefix}/top1_accuracy', metrics[6].mean().item(), step)
         tb_writer.add_scalar(f'{prefix}/top5_accuracy', metrics[7].mean().item(), step)
         tb_writer.add_scalar(f'{prefix}/top20_accuracy', metrics[8].mean().item(), step)
-        
+
     if len(metrics) > 9:
-        if len(metrics[11]) > 0:
-            tb_writer.add_scalar(f'{prefix}/avg_ortho_norm', metrics[9].mean().item(), step)
-            tb_writer.add_scalar(f'{prefix}/max_ortho_norm', metrics[10].max().item(), step)
-            tb_writer.add_histogram(f'{prefix}/ortho_norms', metrics[11], step)
+        tb_writer.add_scalar(f'{prefix}/load_balancing_loss', metrics[9].mean().item(), step)
 
-    if len(metrics) > 12:
-        tb_writer.add_scalar(f'{prefix}/load_balancing_loss', metrics[12].mean().item(), step)
-
-    if len(metrics) > 13:
-        tb_writer.add_scalar(f'{prefix}/alternate_load_balancing_loss', metrics[13].mean().item(), step)
+    if len(metrics) > 10:
+        tb_writer.add_scalar(f'{prefix}/alternate_load_balancing_loss', metrics[10].mean().item(), step)
 
     return loss
-
 
 def evaluate_single(model_engine, name, eval_dataloader, tb_writer, step, eval_gradient_accumulation_steps):
     orig_micro_batches = model_engine.micro_batches
@@ -152,23 +145,14 @@ def evaluate_single(model_engine, name, eval_dataloader, tb_writer, step, eval_g
             break
         for i, metric in enumerate(metrics):
             all_metrics[i].append(metric)
+
     eval_dataloader.reset()
     model_engine.micro_batches = orig_micro_batches
     eval_metrics = [torch.cat(metric_list) for metric_list in all_metrics]
-
-    total_loss = None
+    loss = None
     if is_main_process():
-        regularization_loss = 0.0
-        if lora_config is not None:
-            avg_ortho_norm, max_ortho_norm, ortho_norms = compute_orthogonality_regularization(pipeline_model, config)
-            orthogonality_lambda = config.get('orthogonality_lambda', 0.0)
-            regularization_loss = orthogonality_lambda * avg_ortho_norm
-        # Add regularization loss to the main loss
-        main_loss = eval_metrics[0].mean().item()
-        total_loss = main_loss + regularization_loss
-        # Pass the total_loss to the write_metrics function
-        write_metrics(tb_writer, f'eval/{name}', eval_metrics, total_loss, step)
-    return total_loss
+        loss = write_metrics(tb_writer, f'eval/{name}', eval_metrics, step)
+    return loss
 
 
 def evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps):
@@ -185,48 +169,7 @@ def evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accu
         tb_writer.add_scalar('eval/eval_time_sec', duration, step)
     return sum(loss) / len(loss) if len(loss) > 0 else None
 
-
-def compute_orthogonality_regularization(model, config):
-    norms = []
-    if 'lora_alpha' in config and 'lora_rank' in config:
-        A_keys = []
-        B_keys = []
-        lora_scale = config['lora_alpha'] / config['lora_rank']
-    
-        state_dict = model.state_dict()
-        for key in state_dict.keys():
-            if 'lora_A' in key:
-                A_keys.append(key)
-                B_keys.append(key.replace('lora_A', 'lora_B'))
-    
-        for i in range(len(A_keys)):
-            A = state_dict[A_keys[i]]
-            B = state_dict[B_keys[i]]
-    
-            # Compute approximate Frobenius norm of E = CᵗC - I
-            AB = lora_scale * A @ B
-            AB_norm_sq = torch.norm(AB, p='fro') ** 2
-            AAt = lora_scale * (A @ A.T)
-            BtB = lora_scale * (B.T @ B)
-            trace_AAt_BtB = torch.trace(AAt @ BtB)
-            E_norm_sq_approx = 2 * AB_norm_sq + 2 * trace_AAt_BtB
-            E_norm_approx = torch.sqrt(E_norm_sq_approx)
-            norms.append(E_norm_approx)
-        
-    if len(norms) > 0:
-        norms = torch.stack(norms)
-        if torch.any(torch.isnan(norms)):
-            raise RuntimeError('NaN detected in norms, probably some/all weights are NaN')
-        avg_norm = torch.mean(norms)
-        max_norm = torch.max(norms)
-    else:
-        device = next(model.parameters()).device
-        avg_norm = torch.tensor(0.0, device=device)
-        max_norm = torch.tensor(0.0, device=device)
-        norms = torch.tensor([], device=device)
-    return avg_norm, max_norm, norms
-
-
+"""
 def apply_max_norm_regularization(model, config):
     # modifed from https://github.com/kohya-ss/sd-scripts/blob/main/networks/lora.py
     A_keys = []
@@ -260,6 +203,193 @@ def apply_max_norm_regularization(model, config):
         else:
             ratio = 1.0
         scalednorm = W.norm() * ratio
+        norms.append(scalednorm.item())
+
+    if len(norms) > 0:
+        norms = torch.tensor(norms, dtype=torch.float32)
+        if torch.any(torch.isnan(norms)):
+            raise RuntimeError(f'NaN detected in norms, probably some/all weights are NaN')
+        avg_norm = sum(norms) / len(norms)
+        max_norm = max(norms)
+    else:
+        avg_norm = 0
+        max_norm = 0
+    return keys_scaled, avg_norm, max_norm, norms
+"""
+
+def apply_max_norm_regularization(model, config):
+    """
+    Apply max-norm regularization to the low-rank matrices A and B to ensure that the matrix C = I + A Bᵗ remains
+    close to orthogonal by capping the approximate Frobenius norm of E = CᵗC - I. This process encourages the
+    singular values of C to be close to 1, promoting stability in the network.
+    
+    **Mathematical Justification:**
+    
+    - **Objective:**
+      - Control the deviation of C = I + BA from being orthogonal by limiting the Frobenius norm of E = CᵗC - I.
+    
+    - **Relation to Singular Values:**
+      - The squared Frobenius norm of E relates to the singular values (σₖ) of C:
+      
+        ||E||_F² = Σₖ (σₖ² - 1)²
+      
+      - Minimizing ||E||_F² encourages all σₖ to be close to 1, making C nearly orthogonal.
+    
+    - **Approximation of ||E||_F:**
+      - Computing ||E||_F exactly is computationally intensive for large matrices.
+      - We use an approximation involving leading second-order terms:
+      
+        E_norm² ≈ 2 ||AB||_F² + 2 Tr(AAᵗ * BᵗB) 
+      
+      - This approximation operates on small k x k matrices, making it efficient for large n (the dimension 
+        of A and B) when k ≪ n.
+    
+    **Scaling Relationships and Adjustment of max_norm:**
+    
+    - **Dependence on n and k:**
+      - The approximate E_norm squared scales with both n and k:
+
+        E_norm² ∝ n * k²
+      
+      - As n or k increases, E_norm increases proportionally.
+    
+    - **Adjusting max_norm:**
+      - To maintain consistent regularization when changing n or k, adjust max_norm proportionally:
+      
+        new_max_norm = (n_new / n_old) (k_new / k_old) old_max_norm
+      
+      - This ensures the regularization strength remains appropriate relative to the size of A and B.
+    
+    - **Implications of Not Adjusting max_norm:**
+      - If max_norm isn't adjusted, the regularization effect may become too strong or too weak, potentially
+        leading to underfitting or instability.
+    
+    **Computational Complexity:**
+    
+    - **Exact Computation (Impractical):**
+      - **Forward Pass:** O(n³)
+        - Involves operations on n x n matrices.
+      - **Backward Pass:** O(n³)
+        - Gradients with respect to large matrices are computationally expensive.
+      - **Conclusion:** Not feasible for large n.
+    
+    - **Approximate Computation (Efficient):**
+      - **Forward Pass:** O(n * k²)
+        - Operations involve n x k and k x k matrices.
+      - **Backward Pass:** O(n * k²)
+        - Gradients computed with respect to A and B (n x k matrices).
+      - **Conclusion:** Practical for large n when k ≪ n.
+    
+    **Implementation Details:**
+    
+    - **Scaling Mechanism:**
+      - Compute the approximate E_norm using the approximation.
+      - If E_norm exceeds max_norm:
+        - Compute scaling factor:
+        
+            ratio = desired_norm / current_norm
+            scaling_factor = sqrt(ratio)
+      
+        - Scale A and B:
+        
+            A_scaled = A * scaling_factor
+            B_scaled = B * scaling_factor
+      
+        - This reduces E_norm to be within the max_norm limit.
+    
+    - **Clamping Norms:**
+      - To prevent division by very small numbers, norms are clamped:
+        - Minimum norm: max_norm / 2
+        - Desired norm: up to max_norm
+    
+    - **Exception Handling:**
+      - If NaN values are detected in computed norms, a `RuntimeError` is raised, indicating potential numerical issues.
+    
+    **Parameters:**
+    
+    - `model`:
+      - The neural network model containing the low-rank matrices A and B.
+    
+    - `config` (dict):
+      - Configuration parameters including:
+        - `'lora_alpha'` (float): Scaling factor for the low-rank updates.
+        - `'lora_rank'` (int): The rank (k) of the low-rank decomposition.
+        - `'scale_weight_norms'` (float, optional): The maximum allowed approximate Frobenius norm of E (`max_norm`).
+          Should be adjusted proportionally with n and k.
+    
+    **Returns:**
+    
+    - `keys_scaled` (int):
+      - The number of times scaling was applied to pairs of A and B.
+    
+    - `avg_norm` (float):
+      - The average approximate Frobenius norm of E after scaling.
+    
+    - `max_norm_value` (float):
+      - The maximum approximate Frobenius norm of E after scaling.
+    
+    - `norms` (list of float):
+      - The approximate Frobenius norms of E for each pair of A and B.
+    
+    **Additional Notes:**
+    
+    - **Efficiency:**
+      - By operating on small matrices, the method efficiently enforces the orthogonality constraint on C,
+        crucial for large-scale models.
+    
+    - **Control Over Singular Values:**
+      - Capping E_norm indirectly controls the singular values of C, keeping them close to 1.
+    
+    - **Impact of Regularization Strength:**
+      - **Strong Regularization:**
+        - If max_norm is too small, A and B may be overly restricted, limiting the model's capacity to learn.
+      - **Weak Regularization:**
+        - If max_norm is too large, C may deviate from orthogonality, potentially causing instability.
+    
+    - **Relation to Orthogonal Procrustes Problem:**
+      - Minimizing ||E||_F² is similar to projecting C onto the set of orthogonal matrices, akin to the
+        orthogonal Procrustes problem, but avoids explicit singular value decomposition (SVD).
+    
+    """
+    A_keys = []
+    B_keys = []
+    norms = []
+    keys_scaled = 0
+    lora_scale = config['lora_alpha'] / config['lora_rank']
+
+    state_dict = model.state_dict()
+    for key in state_dict.keys():
+        if 'lora_A' in key:
+            A_keys.append(key)
+            B_keys.append(key.replace('lora_A', 'lora_B'))
+
+    for i in range(len(A_keys)):
+        A = state_dict[A_keys[i]]  # k x n matrix
+        B = state_dict[B_keys[i]]  # n x k matrix
+        
+        # Compute approximate Frobenius norm of E = CᵗC - I, where C = BA (n x n matrix):
+        # Using: ||CᵗC - I||_F² = 2 * ||AB||_F² + 2 * Tr(AAᵗ * BᵗB) + higher order terms
+        AB = lora_scale * (A @ B)     # k x k matrix
+        AB_norm_sq = torch.norm(AB, p='fro') ** 2
+        AAt = lora_scale * (A @ A.T)  # k x k matrix
+        BtB = lora_scale * (B.T @ B)  # k x k matrix
+        trace_AAt_BtB = torch.trace(AAt @ BtB)
+        E_norm_sq_approx = 2 * AB_norm_sq + 2 * trace_AAt_BtB
+        E_norm = torch.sqrt(E_norm_sq_approx)
+
+        if 'scale_weight_norms' in config:
+            max_norm = config['scale_weight_norms']
+            norm = E_norm.clamp(min=max_norm / 2)
+            desired = torch.clamp(norm, max=max_norm)           
+            ratio = desired.cpu() / norm.cpu()
+            if ratio != 1:
+                keys_scaled += 1
+                sqrt_ratio = ratio ** 0.5
+                state_dict[A_keys[i]] *= sqrt_ratio
+                state_dict[B_keys[i]] *= sqrt_ratio
+        else:
+            ratio = 1.0
+        scalednorm = E_norm * ratio
         norms.append(scalednorm.item())
 
     if len(norms) > 0:
@@ -666,40 +796,17 @@ if __name__ == '__main__':
     while True:
         gc.collect()
         torch.cuda.empty_cache()
-    
-        # Manually load data (depends on your data loader implementation)
-        batch = next(train_dataloader)
-        inputs, labels = batch
-    
-        # Forward pass
-        metrics = model_engine(inputs)
-        loss = metrics[0].mean().item()
-    
-        # Compute orthogonality regularization
-        if lora_config is not None and 'eval_before_first_step' in config:
-             # TODO: gather the weight norms across all stages in the pipelined model, not just the first.
-            avg_ortho_norm, max_ortho_norm, ortho_norms = compute_orthogonality_regularization_local(pipeline_model, config)
-            orthogonality_lambda = config.get('orthogonality_lambda', 0.0)
-            loss = loss + orthogonality_lambda * avg_ortho_norm
-    
-        # Backward pass
-        model_engine.backward(loss)
-    
-        # Optimizer step
-        model_engine.step()
-    
-        # Rest of your training loop:
+        metrics = model_engine.train_batch()
         train_dataloader.sync_epoch()
-        
         if lora_config is not None:
             keys_scaled, avg_norm, max_norm, norms = apply_max_norm_regularization(pipeline_model, config)
-            
+
         epoch = saver.process_epoch(epoch, step)
         if epoch is None:
             break
 
         if is_main_process() and step % config['logging_steps'] == 0:
-            write_metrics(tb_writer, 'train', loss, metrics, step)
+            write_metrics(tb_writer, 'train', metrics, step)
             tb_writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], step)
             # TODO: gather the weight norms across all stages in the pipelined model, not just the first.
             if lora_config is not None and len(norms) > 0:
@@ -707,9 +814,6 @@ if __name__ == '__main__':
                 tb_writer.add_scalar('train/avg_weight_norm', avg_norm, step)
                 tb_writer.add_scalar('train/max_weight_norm', max_norm, step)
                 tb_writer.add_histogram('train/weight_norm_hist', norms, step)
-                tb_writer.add_scalar('train/avg_ortho_norm', avg_ortho_norm.item(), step)
-                tb_writer.add_scalar('train/max_ortho_norm', max_ortho_norm.item(), step)
-                tb_writer.add_histogram('train/ortho_norm_hist', ortho_norms, step)
             tb_writer.add_scalar('train/epoch', step/steps_per_epoch, step)
 
         if step % config['eval_steps'] == 0:
