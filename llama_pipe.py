@@ -225,7 +225,8 @@ class LlamaForCausalLMPipe(PipelineModel, transformers.LlamaForCausalLM):
             LayerSpec(
                 ComputeMetrics,
                 loss_type=self.loss_type,
-                focal_loss_gamma=self.focal_loss_gamma
+                focal_loss_gamma=self.focal_loss_gamma,
+                orthogonality_lambda=self.orthogonality_lambda,
             )
         )
         return result
@@ -270,7 +271,8 @@ class Qwen2ForCausalLMPipe(PipelineModel, transformers.Qwen2ForCausalLM):
             LayerSpec(
                 ComputeMetrics,
                 loss_type=self.loss_type,
-                focal_loss_gamma=self.focal_loss_gamma
+                focal_loss_gamma=self.focal_loss_gamma,
+                orthogonality_lambda=self.orthogonality_lambda,
             )
         )
         return result
@@ -321,7 +323,8 @@ class CohereForCausalLMPipe(PipelineModel, transformers.CohereForCausalLM):
                 logit_scale=self.logit_scale,
                 loss_type=self.loss_type,
                 focal_loss_gamma=self.focal_loss_gamma,
-                _estimated_size=embedding_relative_size
+                orthogonality_lambda=self.orthogonality_lambda,
+                _estimated_size=embedding_relative_size,
             )
         )
         return result
@@ -366,7 +369,8 @@ class Phi3ForCausalLMPipe(PipelineModel, transformers.Phi3ForCausalLM):
             LayerSpec(
                 ComputeMetrics,
                 loss_type=self.loss_type,
-                focal_loss_gamma=self.focal_loss_gamma
+                focal_loss_gamma=self.focal_loss_gamma,
+                orthogonality_lambda=self.orthogonality_lambda,
             )
         )
         return result
@@ -418,7 +422,8 @@ class Gemma2ForCausalLMPipe(PipelineModel, transformers.Gemma2ForCausalLM):
                 ComputeMetrics,
                 loss_type=self.loss_type,
                 focal_loss_gamma=self.focal_loss_gamma,
-                _estimated_size=embedding_relative_size
+                orthogonality_lambda=self.orthogonality_lambda,
+                _estimated_size=embedding_relative_size,
             )
         )
         return result
@@ -463,7 +468,8 @@ class MistralForCausalLMPipe(PipelineModel, transformers.MistralForCausalLM):
             LayerSpec(
                 ComputeMetrics,
                 loss_type=self.loss_type,
-                focal_loss_gamma=self.focal_loss_gamma
+                focal_loss_gamma=self.focal_loss_gamma,
+                orthogonality_lambda=self.orthogonality_lambda,
             )
         )
         return result

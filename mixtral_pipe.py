@@ -212,7 +212,8 @@ class MixtralForCausalLMPipe(PipelineModel, transformers.MixtralForCausalLM):
                 num_experts_per_tok=self.num_experts_per_tok,
                 loss_type=self.loss_type,
                 focal_loss_gamma=self.focal_loss_gamma,
-                _estimated_size=0
+                orthogonality_lambda=self.orthogonality_lambda,
+                _estimated_size=0,
             )
         )
         return result

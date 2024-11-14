@@ -83,7 +83,8 @@ class ComputeMetrics(nn.Module):
             self,
             logit_scale=1.0,
             loss_type='cross_entropy_loss',
-            focal_loss_gamma=0
+            focal_loss_gamma=0,
+            orthogonality_lambda=0,  # NOT USE HERE - FOR `engine.py`
         ):
         super().__init__()
         self.logit_scale = logit_scale
@@ -172,6 +173,10 @@ class PipelineModel(nn.Module):
         self.focal_loss_gamma = config.get('focal_loss_gamma', 0)
         if self.focal_loss_gamma > 0 and is_main_process():
             print(f'Optimizing using \'{self.loss_type}\' with gamma={self.focal_loss_gamma}')
+        self.orthogonality_lambda = config.get('orthogonality_lambda', 0)
+        if self.orthogonality_lambda > 0 and is_main_process():
+            print(f'Regularising orthogonality using with lambda={self.orthogonality_lambda}')
+            
 
         for name, p in self.named_parameters():
             p.original_name = name
