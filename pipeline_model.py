@@ -79,8 +79,8 @@ def compute_orthogonality_regularization(model, config):
                 B_keys.append(key.replace('lora_A', 'lora_B'))
     
         for i in range(len(A_keys)):
-            A = module.lora_A.weight
-            B = module.lora_B.weight
+            A = state_dict[A_keys[i]]
+            B = state_dict[B_keys[i]]
     
             # Compute approximate Frobenius norm of E = CᵗC - I
             AB = lora_scale * (A @ B.T)
