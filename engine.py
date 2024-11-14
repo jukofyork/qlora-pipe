@@ -71,18 +71,18 @@ def compute_orthogonality_regularization(model):
         E_norm_approx = torch.sqrt(E_norm_sq_approx)
         norms.append(E_norm_approx)
     
-if len(norms) > 0:
-    norms = torch.stack(norms)
-    if torch.any(torch.isnan(norms)):
-        raise RuntimeError('NaN detected in norms, probably some/all weights are NaN')
-    avg_norm = torch.mean(norms)
-    max_norm = torch.max(norms)
-else:
-    device = next(model.parameters()).device
-    avg_norm = torch.tensor(0.0, device=device)
-    max_norm = torch.tensor(0.0, device=device)
-    norms = torch.tensor([], device=device)
-return avg_norm, max_norm, norms
+    if len(norms) > 0:
+        norms = torch.stack(norms)
+        if torch.any(torch.isnan(norms)):
+            raise RuntimeError('NaN detected in norms, probably some/all weights are NaN')
+        avg_norm = torch.mean(norms)
+        max_norm = torch.max(norms)
+    else:
+        device = next(model.parameters()).device
+        avg_norm = torch.tensor(0.0, device=device)
+        max_norm = torch.tensor(0.0, device=device)
+        norms = torch.tensor([], device=device)
+    return avg_norm, max_norm, norms
 
 
 class CustomPipelineEngine(PipelineEngine):
@@ -114,7 +114,7 @@ class CustomPipelineEngine(PipelineEngine):
 
         # Add orthogonality regularization if configured
         if hasattr(self.module, 'lora_config') and self.module.lora_config is not None:
-            avg_ortho_norm, max_ortho_norm, _ = compute_orthogonality_regularization(self.module)
+            avg_ortho_norm, _, _ = compute_orthogonality_regularization(self.module)
             orthogonality_lambda = self.module.lora_config.get('orthogonality_lambda', 0.0)
             
             # Add regularization to the aggregated loss
