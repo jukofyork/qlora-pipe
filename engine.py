@@ -292,24 +292,28 @@ class CustomPipelineEngine(PipelineEngine):
             else:
                 # Some models just return loss from forward()
                 losses = outputs
-
-            # Debug model inspection
-            print("\nModel inspection:")
-            print("Model type:", type(model))
-            print("Model dir:", dir(model))
-            if hasattr(model, 'train_config'):
-                print("Model train_config found:", {
-                    'lambda': model.train_config.get('orthogonality_lambda'),
-                    'alpha': model.train_config.get('lora_alpha'),
-                    'rank': model.train_config.get('lora_rank')
-                })
+                
+            # Debug inspection
+            print("\nEngine inspection:")
+            print("self.module type:", type(self.module))
+            print("self.module attributes:", dir(self.module))
             
-            print("\nModel parameters inspection:")
-            print("Model parameters type:", type(model_parameters))
-            if model_parameters is not None:
-                print("Number of parameter groups:", len(model_parameters))
-                for i, group in enumerate(model_parameters):
-                    print(f"Group {i} keys:", group.keys())
+            if hasattr(self.module, 'model'):
+                print("\nself.module.model type:", type(self.module.model))
+                print("self.module.model attributes:", dir(self.module.model))
+            
+            if hasattr(self, 'model'):
+                print("\nself.model type:", type(self.model))
+                print("self.model attributes:", dir(self.model))
+            
+            print("\nParameters inspection:")
+            print("self.module.parameters() type:", type(self.module.parameters()))
+            if hasattr(self, 'model_parameters'):
+                print("self.model_parameters type:", type(self.model_parameters))
+                if self.model_parameters is not None:
+                    print("Number of parameter groups:", len(self.model_parameters))
+                    for i, group in enumerate(self.model_parameters):
+                        print(f"Group {i} keys:", group.keys())
 
             # Add orthogonality regularization
             if ('orthogonality_lambda' in self.module.train_config and
