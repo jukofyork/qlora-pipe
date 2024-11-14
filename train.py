@@ -124,9 +124,10 @@ def write_metrics(tb_writer, prefix, metrics, step):
         tb_writer.add_scalar(f'{prefix}/top20_accuracy', metrics[8].mean().item(), step)
         
     if len(metrics) > 9:
-        tb_writer.add_scalar(f'{prefix}/avg_ortho_norm', metrics[9].mean().item(), step)
-        tb_writer.add_scalar(f'{prefix}/max_ortho_norm', metrics[10].max().item(), step)
-        tb_writer.add_histogram(f'{prefix}/ortho_norms', metrics[11], step)
+        if len(metrics[11]) > 0:
+            tb_writer.add_scalar(f'{prefix}/avg_ortho_norm', metrics[9].mean().item(), step)
+            tb_writer.add_scalar(f'{prefix}/max_ortho_norm', metrics[10].max().item(), step)
+            tb_writer.add_histogram(f'{prefix}/ortho_norms', metrics[11], step)
 
     if len(metrics) > 12:
         tb_writer.add_scalar(f'{prefix}/load_balancing_loss', metrics[12].mean().item(), step)
