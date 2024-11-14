@@ -231,6 +231,7 @@ class CustomPipelineEngine(PipelineEngine):
 
 
     # We override this to handle the model returning a list of "losses", but only doing backprop on the first.
+    """
     def _exec_forward_pass(self, buffer_id):
         self.tput_timer.start()
         self.mem_status('BEFORE FWD', reset_max=True)
@@ -300,7 +301,7 @@ class CustomPipelineEngine(PipelineEngine):
                     
             # Add orthogonality regularization
             if (orthogonality_lambda > 0):
-                print(f"orthogonality_lambda={orthogonality_lambda}")
+                #print(f"orthogonality_lambda={orthogonality_lambda}")
                 avg_norm = compute_orthogonality_regularization(self.module)
                 if isinstance(losses, torch.Tensor):
                     losses = losses + orthogonality_lambda * avg_norm
@@ -318,6 +319,142 @@ class CustomPipelineEngine(PipelineEngine):
 
     # make our forward pass method apply
     PipelineEngine._INSTRUCTION_MAP[schedule.ForwardPass] = _exec_forward_pass
+    """
+    
+    def _exec_forward_pass(self, buffer_id):
+        self.tput_timer.start()
+        self.mem_status('BEFORE FWD', reset_max=True)
+   
+        if isinstance(self.pipe_buffers['inputs'][buffer_id], tuple):
+            inputs = tuple(t.clone() for t in self.pipe_buffers['inputs'][buffer_id])
+        else:
+            inputs = self.pipe_buffers['inputs'][buffer_id].clone()
+    
+        # collect the partitioned input from the previous stage
+        if self.is_pipe_partitioned and not self.is_first_stage():
+            part_input = PartitionedTensor.from_meta(meta=inputs[0],
+                                                     local_part=inputs[1],
+                                                     group=self.grid.get_slice_parallel_group())
+    
+            inputs = (part_input.full(), *inputs[2:])
+            inputs[0].requires_grad = True
+            part_input = None
+            # Check if orthogonality regularization is included in inputs
+            if len(inputs) > 1 and isinstance(inputs[-1], torch.Tensor) and inputs[-1].dim() == 0:
+                ortho_reg_prev = inputs[-1]
+                inputs = inputs[:-1]
+            else:
+                ortho_reg_prev = torch.tensor(0.0, device=self.device)
+            inputs = inputs[0] if len(inputs) == 1 else inputs
+            self.pipe_buffers['inputs'][buffer_id] = inputs
+        else:
+            ortho_reg_prev = torch.tensor(0.0, device=self.device)
+    
+        # inputs has no gradient because it is from a cloned tensor
+        outputs = super(PipelineEngine, self).forward(inputs)
+    
+        # Reset activation checkpointing buffers.
+        # Need to call this between evaluation iterations
+        if not self.module.training:
+            ds_checkpointing.reset()
+    
+        # Compute orthogonality regularization
+        orthogonality_lambda = 0
+        if hasattr(self.module, '_layer_specs'):
+             orthogonality_lambda = self.module._layer_specs[-1].module_kwargs.get('orthogonality_lambda', 0)
+    
+        # This version has each node computer their own copy of this:
+        # - Redundant calculation.
+        # - Less network bandwidth.
+        if orthogonality_lambda > 0:
+            ortho_reg = compute_orthogonality_regularization(self.module)
+        else:
+            ortho_reg = torch.tensor(0.0, device=self.device)
+   
+        """
+        # This version only computes it on the first rank:
+        # - No redundant calculation, but others will have to wait for it to complete anyway...?
+        # - More network bandwidth.
+        if orthogonality_lambda > 0:
+            # Get data parallel group and rank
+            dp_group = self.grid.get_data_parallel_group()
+            dp_rank = dist.get_rank(group=dp_group)
+            dp_world_size = dist.get_world_size(group=dp_group)
+            
+            # Compute ortho_reg on the first rank in the DP group
+            if dp_rank == 0:
+                ortho_reg = compute_orthogonality_regularization(self.module)
+            else:
+                ortho_reg = torch.tensor(0.0, device=self.device)
+            
+            # Broadcast ortho_reg to all DP ranks
+            dist.broadcast(ortho_reg, src=0, group=dp_group)
+        else:
+            ortho_reg = torch.tensor(0.0, device=self.device)
+        """
+        
+        # Accumulate orthogonality regularization
+        total_ortho_reg = ortho_reg_prev + ortho_reg
+    
+        # Partition the outputs if we are not the last stage
+        if self.is_pipe_partitioned and not self.is_last_stage():
+            if isinstance(outputs, tuple):
+                first_output = outputs[0]
+                assert all([torch.is_tensor(elt) and elt.requires_grad is False for elt in outputs[1:]])
+                outputs_tail = outputs[1:]
+            elif torch.is_tensor(outputs):
+                first_output = outputs
+                outputs_tail = []
+            else:
+                raise ValueError("expecting a tensor or a tuple of tensors")
+            part = PartitionedTensor(tensor=first_output, group=self.grid.get_slice_parallel_group())
+            # Clear the large output data, but save the computation graph
+            first_output.data = torch.zeros(1)
+            self.pipe_buffers['output_tensors'][buffer_id] = first_output
+            # Inject the partitioned tensor into the output before sending
+            outputs = (part.to_meta(), part.data(), *outputs_tail)
+            part = None
+    
+        # Include the accumulated orthogonality regularization in outputs
+        if isinstance(outputs, tuple):
+            outputs = outputs + (total_ortho_reg,)
+        else:
+            outputs = (outputs, total_ortho_reg)
+    
+        self.pipe_buffers['outputs'][buffer_id] = outputs
+    
+        # Optionally compute loss on the last device
+        if self.is_last_stage():
+            if isinstance(outputs, tuple):
+                total_ortho_reg = outputs[-1]
+                outputs = outputs[:-1]
+    
+            if self._compute_loss and self.module.loss_fn is not None:
+                labels = self.pipe_buffers['labels'][buffer_id]
+                losses = self.module.loss_fn(outputs, labels)
+            else:
+                # Some models just return loss from forward()
+                losses = outputs
+    
+            # Add orthogonality regularization
+            if orthogonality_lambda > 0:
+                if isinstance(losses, torch.Tensor):
+                    losses = losses + orthogonality_lambda * total_ortho_reg
+                else:
+                    losses = (losses[0] + orthogonality_lambda * total_ortho_reg, *losses[1:])
+         
+            if self.eval_return_logits:
+                self.outputs = outputs
+            if isinstance(losses, torch.Tensor):
+                self.loss = losses
+                self.fwd_outputs.append([self.loss.detach()])
+            else:
+                self.loss = losses[0]
+                self.fwd_outputs.append([l.detach() for l in losses])
+    
+    # make our forward pass method apply
+    PipelineEngine._INSTRUCTION_MAP[schedule.ForwardPass] = _exec_forward_pass
+   
 
 
 class CustomPipelineModule(PipelineModule):
