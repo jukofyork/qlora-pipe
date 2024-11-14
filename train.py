@@ -38,7 +38,6 @@ parser.add_argument('--local_rank', type=int, default=-1,
                     help='local rank passed from distributed launcher')
 parser.add_argument('--debug_dataset', type=int, help='print out this many training examples and then quit')
 parser.add_argument('--resume_from_checkpoint', action='store_true', default=None, help='resume training from the most recent checkpoint')
-parser.add_argument('--no_quantiles', action='store_true', help='suppress output of quantile metrics')
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 
@@ -66,8 +65,8 @@ def get_most_recent_run_dir(output_dir):
     return list(sorted(glob.glob(os.path.join(output_dir, '*'))))[-1]
 
 
-def write_metrics(tb_writer, prefix, metrics, step):
-    loss = metrics[0].mean().item()
+def write_metrics(tb_writer, prefix, metrics, loss, step):
+    #loss = metrics[0].mean().item()
     tb_writer.add_scalar(f'{prefix}/loss', loss, step)
 
     if len(metrics) > 1:
@@ -137,6 +136,7 @@ def write_metrics(tb_writer, prefix, metrics, step):
 
     return loss
 
+
 def evaluate_single(model_engine, name, eval_dataloader, tb_writer, step, eval_gradient_accumulation_steps):
     orig_micro_batches = model_engine.micro_batches
     model_engine.micro_batches = eval_gradient_accumulation_steps
@@ -151,14 +151,24 @@ def evaluate_single(model_engine, name, eval_dataloader, tb_writer, step, eval_g
             break
         for i, metric in enumerate(metrics):
             all_metrics[i].append(metric)
-
     eval_dataloader.reset()
     model_engine.micro_batches = orig_micro_batches
     eval_metrics = [torch.cat(metric_list) for metric_list in all_metrics]
-    loss = None
+
+    # Compute regularization term
+    regularization_loss = 0.0
+    if lora_config is not None:
+        avg_ortho_norm, max_ortho_norm, ortho_norms = compute_orthogonality_regularization(pipeline_model.module, config)
+        orthogonality_lambda = config.get('orthogonality_lambda', 0.0)
+        regularization_loss = orthogonality_lambda * avg_ortho_norm
+
     if is_main_process():
-        loss = write_metrics(tb_writer, f'eval/{name}', eval_metrics, step)
-    return loss
+        # Add regularization loss to the main loss
+        main_loss = eval_metrics[0].mean().item()
+        total_loss = main_loss + regularization_loss.item()
+        # Pass the total_loss to the write_metrics function
+        write_metrics(tb_writer, f'eval/{name}', eval_metrics, total_loss, step)
+    return total_loss
 
 
 def evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps):
@@ -174,6 +184,46 @@ def evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accu
     if is_main_process():
         tb_writer.add_scalar('eval/eval_time_sec', duration, step)
     return sum(loss) / len(loss) if len(loss) > 0 else None
+
+
+def compute_orthogonality_regularization(model, config):
+    norms = []
+    if 'lora_alpha' in config and 'lora_rank' in config:
+        A_keys = []
+        B_keys = []
+        lora_scale = config['lora_alpha'] / config['lora_rank']
+    
+        state_dict = model.state_dict()
+        for key in state_dict.keys():
+            if 'lora_A' in key:
+                A_keys.append(key)
+                B_keys.append(key.replace('lora_A', 'lora_B'))
+    
+        for i in range(len(A_keys)):
+            A = state_dict[A_keys[i]]
+            B = state_dict[B_keys[i]]
+    
+            # Compute approximate Frobenius norm of E = CᵗC - I
+            AB = lora_scale * A @ B
+            AB_norm_sq = torch.norm(AB, p='fro') ** 2
+            AAt = lora_scale * (A @ A.T)
+            BtB = lora_scale * (B.T @ B)
+            trace_AAt_BtB = torch.trace(AAt @ BtB)
+            E_norm_sq_approx = 2 * AB_norm_sq + 2 * trace_AAt_BtB
+            E_norm_approx = torch.sqrt(E_norm_sq_approx)
+            norms.append(E_norm_approx)
+        
+    if len(norms) > 0:
+        norms = torch.stack(norms)
+        if torch.any(torch.isnan(norms)):
+            raise RuntimeError('NaN detected in norms, probably some/all weights are NaN')
+        avg_norm = torch.mean(norms)
+        max_norm = torch.max(norms)
+    else:
+        device = next(model.parameters()).device
+        avg_norm = torch.tensor(0.0, device=device)
+        max_norm = torch.tensor(0.0, device=device)
+    return avg_norm, max_norm, norms
 
 
 def apply_max_norm_regularization(model, config):
@@ -615,17 +665,40 @@ if __name__ == '__main__':
     while True:
         gc.collect()
         torch.cuda.empty_cache()
-        metrics = model_engine.train_batch()
+    
+        # Manually load data (depends on your data loader implementation)
+        batch = next(train_dataloader)
+        inputs, labels = batch
+    
+        # Forward pass
+        metrics = model_engine(inputs)
+        loss = metrics[0].mean().item()
+    
+        # Compute orthogonality regularization
+        if lora_config is not None and 'eval_before_first_step' in config:
+             # TODO: gather the weight norms across all stages in the pipelined model, not just the first.
+            avg_ortho_norm, max_ortho_norm, ortho_norms = compute_orthogonality_regularization_local(pipeline_model.module, config)
+            orthogonality_lambda = config.get('orthogonality_lambda', 0.0)
+            loss = loss + orthogonality_lambda * avg_ortho_norm
+    
+        # Backward pass
+        model_engine.backward(loss)
+    
+        # Optimizer step
+        model_engine.step()
+    
+        # Rest of your training loop:
         train_dataloader.sync_epoch()
+        
         if lora_config is not None:
             keys_scaled, avg_norm, max_norm, norms = apply_max_norm_regularization(pipeline_model, config)
-
+            
         epoch = saver.process_epoch(epoch, step)
         if epoch is None:
             break
 
         if is_main_process() and step % config['logging_steps'] == 0:
-            write_metrics(tb_writer, 'train', metrics, step)
+            write_metrics(tb_writer, 'train', loss, metrics, step)
             tb_writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], step)
             # TODO: gather the weight norms across all stages in the pipelined model, not just the first.
             if lora_config is not None and len(norms) > 0:
@@ -633,6 +706,9 @@ if __name__ == '__main__':
                 tb_writer.add_scalar('train/avg_weight_norm', avg_norm, step)
                 tb_writer.add_scalar('train/max_weight_norm', max_norm, step)
                 tb_writer.add_histogram('train/weight_norm_hist', norms, step)
+                tb_writer.add_scalar('train/avg_ortho_norm', avg_ortho_norm.item(), step)
+                tb_writer.add_scalar('train/max_ortho_norm', max_ortho_norm.item(), step)
+                tb_writer.add_histogram('train/ortho_norm_hist', ortho_norms, step)
             tb_writer.add_scalar('train/epoch', step/steps_per_epoch, step)
 
         if step % config['eval_steps'] == 0:
