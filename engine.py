@@ -44,15 +44,12 @@ def initialize(args=None,
 
     return engine, engine.optimizer
 
-# NOTE: Later, this should also incorporate the lora_scale like this:
-#       `lora_scale = config['lora_alpha'] / config['lora_rank']
-#       AB = lora_scale * A @ B
-#       AAt = lora_scale * (A @ A.T)
-#       BtB = lora_scale * (B.T @ B)
-def compute_orthogonality_regularization(model):
-    norms = []
+def compute_orthogonality_regularization(model, config):
     A_keys = []
     B_keys = []
+    norms = []
+    lora_scale = config['lora_alpha'] / config['lora_rank']
+
     state_dict = model.state_dict()
     for key in state_dict.keys():
         if 'lora_A' in key:
@@ -64,10 +61,10 @@ def compute_orthogonality_regularization(model):
         B = state_dict[B_keys[i]]  # n x k
 
         # Compute approximate Frobenius norm of E = CᵗC - I
-        AB = A @ B     # k x k
+        AB = lora_scale * (A @ B)     # k x k
         AB_norm_sq = torch.norm(AB, p='fro') ** 2
-        AAt = A @ A.T  # k x k
-        BtB = B.T @ B  # k x k
+        AAt = lora_scale * (A @ A.T)  # k x k
+        BtB = lora_scale * (B.T @ B)  # k x k
         trace_AAt_BtB = torch.trace(AAt @ BtB)
         E_norm_sq_approx = 2 * AB_norm_sq + 2 * trace_AAt_BtB
         E_norm_approx = torch.sqrt(E_norm_sq_approx)
@@ -297,12 +294,15 @@ class CustomPipelineEngine(PipelineEngine):
                 losses = outputs
 
             # Add orthogonality regularization
-            avg_norm = compute_orthogonality_regularization(self.module)
-            orthogonality_lambda = 0.1
-            if isinstance(losses, torch.Tensor):
-                losses = losses + orthogonality_lambda * avg_norm
-            else:
-                losses = (losses[0] + orthogonality_lambda * avg_norm, *losses[1:])
+            if ('orthogonality_lambda' in self.module.train_config and
+                'lora_alpha' in self.module.train_config and
+                'lora_rank' in self.module.train_config):
+                avg_norm = compute_orthogonality_regularization(self.module, self.module.train_config)
+                orthogonality_lambda = self.module.train_config['orthogonality_lambda']
+                if isinstance(losses, torch.Tensor):
+                    losses = losses + orthogonality_lambda * avg_norm
+                else:
+                    losses = (losses[0] + orthogonality_lambda * avg_norm, *losses[1:])
         
             if self.eval_return_logits:
                 self.outputs = outputs
