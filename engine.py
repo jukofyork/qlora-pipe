@@ -293,13 +293,14 @@ class CustomPipelineEngine(PipelineEngine):
                 # Some models just return loss from forward()
                 losses = outputs
 
-            for i, layer in enumerate(self.module._layer_specs):
-                lambda_val = getattr(layer, 'orthogonality_lambda', 0)
-                if lambda_val > 0:
-                    print(f"Found orthogonality_lambda={lambda_val} in layer {i} of {len(self.module._layer_specs)}")
-        
+            orthogonality_lambda = 0
+            if hasattr(self.module, '_layer_specs'):
+                last_layer = self.module._layer_specs[-1]  # Get the last layer spec
+                if isinstance(last_layer, LayerSpec) and last_layer.typename == ComputeMetrics:
+                    orthogonality_lambda = last_layer.module_kwargs.get('orthogonality_lambda', 0)
+            print(f"orthogonality_lambda = {orthogonality_lambda}")
+                    
             # Add orthogonality regularization
-            orthogonality_lambda = getattr(self.module._layer_specs[-1], 'orthogonality_lambda', 0)
             if (orthogonality_lambda > 0):
                 print(f"orthogonality_lambda={orthogonality_lambda}")
                 avg_norm = compute_orthogonality_regularization(self.module)
