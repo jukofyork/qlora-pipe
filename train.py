@@ -156,17 +156,16 @@ def evaluate_single(model_engine, name, eval_dataloader, tb_writer, step, eval_g
     model_engine.micro_batches = orig_micro_batches
     eval_metrics = [torch.cat(metric_list) for metric_list in all_metrics]
 
-    # Compute regularization term
-    regularization_loss = 0.0
-    if lora_config is not None:
-        avg_ortho_norm, max_ortho_norm, ortho_norms = compute_orthogonality_regularization(pipeline_model, config)
-        orthogonality_lambda = config.get('orthogonality_lambda', 0.0)
-        regularization_loss = orthogonality_lambda * avg_ortho_norm
-
+    total_loss = None
     if is_main_process():
+        regularization_loss = 0.0
+        if lora_config is not None:
+            avg_ortho_norm, max_ortho_norm, ortho_norms = compute_orthogonality_regularization(pipeline_model, config)
+            orthogonality_lambda = config.get('orthogonality_lambda', 0.0)
+            regularization_loss = orthogonality_lambda * avg_ortho_norm
         # Add regularization loss to the main loss
         main_loss = eval_metrics[0].mean().item()
-        total_loss = main_loss + regularization_loss.item()
+        total_loss = main_loss + regularization_loss
         # Pass the total_loss to the write_metrics function
         write_metrics(tb_writer, f'eval/{name}', eval_metrics, total_loss, step)
     return total_loss
