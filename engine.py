@@ -49,7 +49,7 @@ def compute_orthogonality_regularization(model):
     """
     Computes approximation of ||CᵗC - I||_F², where C = I + BA:
     - Full expansion is ||BA + AB + (BA)(AB)||_F²
-    - For small-norm A,B, we approximate using just ||BA + AB||_F²
+    - For small-norm ||A||,||B|| we approximate using just ||BA + AB||_F²
     - This expands to ||BA||_F² + ||AB||_F² + 2⟨BA,AB⟩ = 2||AB||_F² + 2Tr(AAᵗBᵗB)
     
     Computationally, this approximation exploits that BA has rank ≤ k (k << n):
@@ -61,18 +61,19 @@ def compute_orthogonality_regularization(model):
     Numerically, this is a good approximation when ||A||,||B|| are small (< 1):
     - The two retained terms are both O(||A||⁴,||B||⁴)
     - The dropped (BA)(AB) term is O(||A||⁸,||B||⁸)
+    - When ||A||,||B|| are large (>> 1), the dropped term starts to dominate though...
     
     The two retained terms have distinct interpretations:
     1. ||AB||_F²
-       - Cross-covariance term penalising scaling.
-       - AB is the k x k cross-covariance matrix.
-       - Measures magnitude/energy of the k x k transformation AB.
-       - Large values indicate BA is scaling vectors up/down too much.
+       - Cross-covariance term penalising scaling
+       - AB is the k x k cross-covariance matrix
+       - Measures magnitude/energy of the k x k transformation AB
+       - Large values indicate BA is scaling vectors up/down too much
     2. Tr(AAᵗBᵗB)
-       - Covariance alignment term penalising shearing/skewing.
-       - AAᵗ and BᵗB are k x k the covariance matrices
+       - Covariance alignment term penalising shearing/skewing
+       - AAᵗ and BᵗB are the k x k covariance matrices
        - Their product/trace measures non-orthogonal rotation effects
-       - Large values mean BA introduces unwanted shearing/skewing.
+       - Large values mean BA introduces unwanted shearing/skewing
     """
     lora_scale = 1.0  # TODO: Pass in same way as orthogonality_lambda via ComputeMetrics
 
