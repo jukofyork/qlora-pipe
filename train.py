@@ -246,8 +246,6 @@ def compute_orthogonality_norms(model, config):
        - Their product/trace measures non-orthogonal rotation effects
        - Large values mean BA introduces unwanted shearing/skewing.
     """
-    A_keys = []
-    B_keys = []
     norms = []
     lora_scale = config['lora_alpha'] / config['lora_rank']
 
