@@ -76,8 +76,9 @@ def compute_orthogonality_regularization(model):
     """
     lora_scale = 1.0  # TODO: Pass in same way as orthogonality_lambda via ComputeMetrics
 
-    total_norm = 0.0
-    lora_count = 0
+    device = next(model.parameters()).device
+    total_norm = torch.tensor(0.0, device=device)
+    lora_count = torch.tensor(0, device=device)
 
     state_dict = model.state_dict()
     for key in state_dict.keys():
@@ -89,21 +90,13 @@ def compute_orthogonality_regularization(model):
             AAt = lora_scale * (A @ A.T)                     # k x k
             BtB = lora_scale * (B.T @ B)                     # k x k
             trace_AAt_BtB = torch.trace(AAt @ BtB)
-            E_norm_sq_approx = 2 * AB_norm_sq + 2 * trace_AAt_BtB           
-            total_norm += E_norm_sq_approx.item()
+            E_norm_sq_approx = 2 * AB_norm_sq + 2 * trace_AAt_BtB
+            
+            total_norm += E_norm_sq_approx.to(device)
             lora_count += 1
 
-    if lora_count > 0:
-        if torch.isnan(torch.tensor(total_norm)):
-            raise RuntimeError('NaN detected in norm calculation, probably some/all weights are NaN')
-    else:
-        device = next(model.parameters()).device
-        total_norm = 0.0
-    
-    # Convert to tensors on the appropriate device
-    device = next(model.parameters()).device
-    total_norm = torch.tensor(total_norm, device=device)
-    lora_count = torch.tensor(lora_count, device=device)
+    if torch.isnan(total_norm):
+        raise RuntimeError('NaN detected in norm calculation, probably some/all weights are NaN')
     
     # Return sum and count, as these will be accumulated over the pipeline stages 
     return total_norm, lora_count
@@ -121,40 +114,34 @@ def compute_lp_regularization(model, p = 2):
     """
     assert p >= 1, "p<1 is non-convex and not suitable for gradient-based optimization methods"
     lora_scale = 1.0  # TODO: Pass in same way as orthogonality_lambda via ComputeMetrics
-
-    total_norm = 0.0
-    lora_count = 0
+    
+    device = next(model.parameters()).device
+    total_norm = torch.tensor(0.0, device=device)
+    lora_count = torch.tensor(0, device=device)
 
     state_dict = model.state_dict()
     for key in state_dict.keys():
         if 'lora_A' in key:
             A = state_dict[key]                              # k x m
             B = state_dict[key.replace('lora_A', 'lora_B')]  # n x k
+
             if p == 2:
                 # Special case for p=2: use efficient trace method
                 AAt = lora_scale * (A @ A.T)                 # k x k
                 BAAt = B @ AAt                               # n x k
                 norm = lora_scale * torch.trace(BAAt @ B.T)
-                total_norm += 0.5 * norm.item()   # L2-regularization gradient normaliser
             else:
                 # For other p values, need to materialise B @ A
                 BA = lora_scale * (B @ A)                    # n x m
                 norm = torch.sum(torch.abs(BA) ** p)
-                total_norm += (1.0 / p) * norm.item()  # Lp-regularization gradient normaliser              
+
+            # Divide by p to cancel out the derivative pulling the power down.
+            total_norm += ((1.0 / p) * norm_p).to(device)
             lora_count += 1
 
-    if lora_count > 0:
-        if torch.isnan(torch.tensor(total_norm)):
-            raise RuntimeError('NaN detected in norm calculation, probably some/all weights are NaN')
-    else:
-        device = next(model.parameters()).device
-        total_norm = 0.0
-    
-    # Convert to tensors on the appropriate device
-    device = next(model.parameters()).device
-    total_norm = torch.tensor(total_norm, device=device)
-    lora_count = torch.tensor(lora_count, device=device)
-    
+    if torch.isnan(total_norm):
+        raise RuntimeError('NaN detected in norm calculation, probably some/all weights are NaN')
+
     # Return sum and count, as these will be accumulated over the pipeline stages 
     return total_norm, lora_count
 
