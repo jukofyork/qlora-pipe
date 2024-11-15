@@ -218,6 +218,34 @@ def apply_max_norm_regularization(model, config):
 
 
 def compute_orthogonality_norms(model, config):
+    """
+    Computes approximation of ||CᵗC - I||_F², where C = I + BA:
+    - Full expansion is ||BA + AB + (BA)(AB)||_F²
+    - For small-norm A,B, we approximate using just ||BA + AB||_F²
+    - This expands to ||BA||_F² + ||AB||_F² + 2⟨BA,AB⟩ = 2||AB||_F² + 2Tr(AAᵗBᵗB)
+    
+    Computationally, this approximation exploits that BA has rank ≤ k (k << n):
+    - Approximate version is O(k³), full expansion would be O(k⁴) due to (BA)(AB) term.
+    - Avoids O(n³) operations of computing full ||BABᵗA - I||²_F
+    - Captures main effects in k-dim subspace spanned by A,B
+    - Valid since BA≈0 outside this subspace due to low rank
+    
+    Numerically, this is a good approximation when ||A||,||B|| are small (< 1):
+    - The two retained terms are both O(||A||⁴,||B||⁴)
+    - The dropped (BA)(AB) term is O(||A||⁸,||B||⁸)
+    
+    The two retained terms have distinct interpretations:
+    1. ||AB||_F²
+       - Cross-covariance term penalising scaling.
+       - AB is the k x k cross-covariance matrix.
+       - Measures magnitude/energy of the k x k transformation AB.
+       - Large values indicate BA is scaling vectors up/down too much.
+    2. Tr(AAᵗBᵗB)
+       - Covariance alignment term penalising shearing/skewing.
+       - AAᵗ and BᵗB are k x k the covariance matrices
+       - Their product/trace measures non-orthogonal rotation effects
+       - Large values mean BA introduces unwanted shearing/skewing.
+    """
     A_keys = []
     B_keys = []
     norms = []
@@ -226,22 +254,16 @@ def compute_orthogonality_norms(model, config):
     state_dict = model.state_dict()
     for key in state_dict.keys():
         if 'lora_A' in key:
-            A_keys.append(key)
-            B_keys.append(key.replace('lora_A', 'lora_B'))
-
-    for i in range(len(A_keys)):
-        A = state_dict[A_keys[i]]  # k x n
-        B = state_dict[B_keys[i]]  # n x k
-
-        # Compute approximate Frobenius norm of E = CᵗC - I
-        AB = lora_scale * (A @ B)     # k x k
-        AB_norm_sq = torch.norm(AB, p='fro') ** 2
-        AAt = lora_scale * (A @ A.T)  # k x k
-        BtB = lora_scale * (B.T @ B)  # k x k
-        trace_AAt_BtB = torch.trace(AAt @ BtB)
-        E_norm_sq_approx = 2 * AB_norm_sq + 2 * trace_AAt_BtB
-        E_norm_approx = torch.sqrt(E_norm_sq_approx)
-        norms.append(E_norm_approx)
+            A = state_dict[key]                              # k x n
+            B = state_dict[key.replace('lora_A', 'lora_B')]  # n x k
+            AB = lora_scale * (A @ B)                        # k x k
+            AB_norm_sq = torch.norm(AB, p='fro') ** 2
+            AAt = lora_scale * (A @ A.T)                     # k x k
+            BtB = lora_scale * (B.T @ B)                     # k x k
+            trace_AAt_BtB = torch.trace(AAt @ BtB)
+            E_norm_sq_approx = 2 * AB_norm_sq + 2 * trace_AAt_BtB
+            E_norm_approx = torch.sqrt(E_norm_sq_approx)
+            norms.append(E_norm_approx)  # sqrt(E_norm²) better for plotting...
     
     if len(norms) > 0:
         norms = torch.stack(norms)

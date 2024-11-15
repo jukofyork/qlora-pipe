@@ -44,75 +44,98 @@ def initialize(args=None,
 
     return engine, engine.optimizer
 
-"""
-Orthogonality regularization for LoRA matrices A (k x n) and B (n x k):
-- Penalizes when BA (n x n) deviates from being an orthogonal transformation
-- Uses squared Frobenius norm ||CCᵗ - I||²_F where C = BA
-- Split into two interpretable terms that can have separate lambda weights:
-  1. ||AB||²_F - Cross-covariance term penalizing scaling
-     - Measures magnitude/energy of the k x k transformation AB
-     - Large values indicate BA is scaling vectors up/down too much
-  2. Tr(AAᵗBᵗB) - Covariance alignment term penalizing skewing  
-     - AAᵗ and BᵗB are k x k covariance matrices
-     - Their product/trace measures non-orthogonal rotation effects
-     - Large values mean BA introduces unwanted shearing/skewing
 
-We use squared norm (not sqrt) because:
-- Matches L2/weight decay convention of using squared penalties
-- Gives smoother gradients (sqrt derivative has 1/sqrt term)
-- Penalizes larger deviations more strongly
-- More stable optimization behavior
-
-Mathematical approximation:
-The actual regularization we want is ||BABᵗA - I||²_F for the n x n matrix BA
-But computing this directly requires O(n³) or O(n⁴) operations
-Instead we exploit that BA has rank at most k (k << n) and approximate using
-k x k matrices AB and covariance terms AAᵗ, BᵗB
-This works because:
-- BA's effect is mainly in the k-dimensional subspace spanned by A,B
-- The approximation captures scaling/rotation in this important subspace
-- Outside this subspace BA≈0 anyway due to low rank
-- Empirically validated to effectively regularize orthogonality
-- Computationally feasible since k is small (e.g. k=64 vs n=8192)
-
-The two penalty terms may need separate scaling factors to be comparable
-magnitude-wise before applying different lambda weights for scaling vs skewing.
-"""
 def compute_orthogonality_regularization(model):
-    A_keys = []
-    B_keys = []
-    norms = []
-    lora_scale = 1.0  ## TODO: Pass in same way as orthogonality_lambda via ComputeMetrics
+    """
+    Computes approximation of ||CᵗC - I||_F², where C = I + BA:
+    - Full expansion is ||BA + AB + (BA)(AB)||_F²
+    - For small-norm A,B, we approximate using just ||BA + AB||_F²
+    - This expands to ||BA||_F² + ||AB||_F² + 2⟨BA,AB⟩ = 2||AB||_F² + 2Tr(AAᵗBᵗB)
+    
+    Computationally, this approximation exploits that BA has rank ≤ k (k << n):
+    - Approximate version is O(k³), full expansion would be O(k⁴) due to (BA)(AB) term.
+    - Avoids O(n³) operations of computing full ||BABᵗA - I||²_F
+    - Captures main effects in k-dim subspace spanned by A,B
+    - Valid since BA≈0 outside this subspace due to low rank
+    
+    Numerically, this is a good approximation when ||A||,||B|| are small (< 1):
+    - The two retained terms are both O(||A||⁴,||B||⁴)
+    - The dropped (BA)(AB) term is O(||A||⁸,||B||⁸)
+    
+    The two retained terms have distinct interpretations:
+    1. ||AB||_F²
+       - Cross-covariance term penalising scaling.
+       - AB is the k x k cross-covariance matrix.
+       - Measures magnitude/energy of the k x k transformation AB.
+       - Large values indicate BA is scaling vectors up/down too much.
+    2. Tr(AAᵗBᵗB)
+       - Covariance alignment term penalising shearing/skewing.
+       - AAᵗ and BᵗB are k x k the covariance matrices
+       - Their product/trace measures non-orthogonal rotation effects
+       - Large values mean BA introduces unwanted shearing/skewing.
+    """
+    total_norm = torch.tensor(0.0, device=next(model.parameters()).device)
+    lora_scale = 1.0  # TODO: Pass in same way as orthogonality_lambda via ComputeMetrics
 
     state_dict = model.state_dict()
     for key in state_dict.keys():
         if 'lora_A' in key:
-            A_keys.append(key)
-            B_keys.append(key.replace('lora_A', 'lora_B'))
+            A = state_dict[key]                              # k x n
+            B = state_dict[key.replace('lora_A', 'lora_B')]  # n x k
+            AB = lora_scale * (A @ B)                        # k x k
+            AB_norm_sq = torch.norm(AB, p='fro') ** 2
+            AAt = lora_scale * (A @ A.T)                     # k x k
+            BtB = lora_scale * (B.T @ B)                     # k x k
+            trace_AAt_BtB = torch.trace(AAt @ BtB)
+            E_norm_sq_approx = 2 * AB_norm_sq + 2 * trace_AAt_BtB
+            
+            total_norm += E_norm_sq_approx
 
-    for i in range(len(A_keys)):
-        A = state_dict[A_keys[i]]  # k x n
-        B = state_dict[B_keys[i]]  # n x k
-
-        # Compute approximate Frobenius norm of E = CᵗC - I
-        AB = lora_scale * (A @ B)     # k x k
-        AB_norm_sq = torch.norm(AB, p='fro') ** 2
-        AAt = lora_scale * (A @ A.T)  # k x k
-        BtB = lora_scale * (B.T @ B)  # k x k
-        trace_AAt_BtB = torch.trace(AAt @ BtB)
-        E_norm_sq_approx = 2 * AB_norm_sq + 2 * trace_AAt_BtB
-        # Use the squared value for regulariser!
-        norms.append(E_norm_sq_approx)
+    if torch.isnan(total_norm):
+        raise RuntimeError('NaN detected in norm calculation, probably some/all weights are NaN')
     
-    if len(norms) > 0:
-        norms = torch.stack(norms)
-        if torch.any(torch.isnan(norms)):
-            raise RuntimeError('NaN detected in norms, probably some/all weights are NaN')
-        avg_norm = torch.mean(norms)
-    else:
-        device = next(model.parameters()).device
-        avg_norm = torch.tensor(0.0, device=device)
-    return avg_norm
+    # Return sum, as these will be accumulated over the pipeline stages 
+    return total_norm
+
+
+def compute_lp_regularization(model, p = 2):
+    """Computes Lp-Regularisation (aka "Power Ridge Regression" or "Bridge Regression")
+    
+    Args:
+        model: The model containing LoRA weights
+        p: Power for the norm, must be >= 1 (default=2)
+           p=2 gives Ridge Regression, p=1 gives Lasso
+    
+    See: https://www.stat.cmu.edu/technometrics/90-00/vol-35-02/v3502109.pdf
+    """
+    assert p >= 1, "p<1 is non-convex and not suitable for gradient-based optimization methods"
+    
+    total_norm = torch.tensor(0.0, device=next(model.parameters()).device)
+    lora_scale = 1.0  # TODO: Pass in same way as orthogonality_lambda via ComputeMetrics
+
+    state_dict = model.state_dict()
+    for key in state_dict.keys():
+        if 'lora_A' in key:
+            A = state_dict[key]                              # k x m
+            B = state_dict[key.replace('lora_A', 'lora_B')]  # n x k
+
+            if p == 2:
+                # Special case for p=2: use efficient trace method
+                AAt = lora_scale * (A @ A.T)                 # k x k
+                BAAt = B @ AAt                               # n x k
+                norm_p = lora_scale * torch.trace(BAAt @ B.T)
+                total_norm += 0.5 * norm_p   # L2-regularization gradient normaliser
+            else:
+                # For other p values, need to materialise B @ A
+                BA = lora_scale * (B @ A)                    # n x m
+                norm_p = torch.sum(torch.abs(BA) ** p)
+                total_norm += (1.0 / p) * norm_p  # Lp-regularization gradient normaliser
+
+    if torch.isnan(total_norm):
+        raise RuntimeError('NaN detected in norm calculation, probably some/all weights are NaN')
+
+    # Return sum, as these will be accumulated over the pipeline stages 
+    return total_norm
 
 
 class CustomPipelineEngine(PipelineEngine):
