@@ -53,7 +53,7 @@ def compute_orthogonality_regularization(model):
     - This expands to ||BA||_F² + ||AB||_F² + 2⟨BA,AB⟩ = 2||AB||_F² + 2Tr(AAᵗBᵗB)
     
     Computationally, this approximation exploits that BA has rank ≤ k (k << n):
-    - Approximate version is O(k³), full expansion would be O(k⁴) due to (BA)(AB) term.
+    - Approximate version is O(nk²), full expansion would be O(n²k) due to (BA)(AB) term.
     - Avoids O(n³) operations of computing full ||BABᵗA - I||²_F
     - Captures main effects in k-dim subspace spanned by A,B
     - Valid since BA≈0 outside this subspace due to low rank
