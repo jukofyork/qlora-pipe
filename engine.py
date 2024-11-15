@@ -77,23 +77,23 @@ def compute_orthogonality_regularization(model):
     """
     lora_scale = 1.0  # TODO: Pass in same way as orthogonality_lambda via ComputeMetrics
 
-    device = next(model.parameters()).device
-    total_norm = torch.tensor(0.0, device=device)
-    lora_count = torch.tensor(0, device=device)
+    total_norm = 0.0
+    lora_count = 0
 
-    state_dict = model.state_dict()
-    for key in state_dict.keys():
-        if 'lora_A' in key:
-            A = state_dict[key]                              # k x n
-            B = state_dict[key.replace('lora_A', 'lora_B')]  # n x k
-            AB = lora_scale * (A @ B)                        # k x k
+    for name, param in model.named_parameters():
+        if 'lora_A' in name:
+            A = param                                   # k x n
+            B_name = name.replace('lora_A', 'lora_B')
+            B = next(p for n, p in model.named_parameters() if n == B_name)  # n x k
+            
+            AB = lora_scale * (A @ B)                   # k x k
             AB_norm_sq = torch.norm(AB, p='fro') ** 2
-            AAt = lora_scale * (A @ A.T)                     # k x k
-            BtB = lora_scale * (B.T @ B)                     # k x k
+            AAt = lora_scale * (A @ A.T)                # k x k
+            BtB = lora_scale * (B.T @ B)                # k x k
             trace_AAt_BtB = torch.trace(AAt @ BtB)
             E_norm_sq_approx = 2 * AB_norm_sq + 2 * trace_AAt_BtB
             
-            total_norm += E_norm_sq_approx.to(device)
+            total_norm += E_norm_sq_approx
             lora_count += 1
 
     if torch.isnan(total_norm):
@@ -116,15 +116,14 @@ def compute_lp_regularization(model, p = 2):
     assert p >= 1, "p<1 is non-convex and not suitable for gradient-based optimization methods"
     lora_scale = 1.0  # TODO: Pass in same way as orthogonality_lambda via ComputeMetrics
     
-    device = next(model.parameters()).device
-    total_norm = torch.tensor(0.0, device=device)
-    lora_count = torch.tensor(0, device=device)
+    total_norm = 0.0
+    lora_count = 0
 
-    state_dict = model.state_dict()
-    for key in state_dict.keys():
-        if 'lora_A' in key:
-            A = state_dict[key]                              # k x m
-            B = state_dict[key.replace('lora_A', 'lora_B')]  # n x k
+    for name, param in model.named_parameters():
+        if 'lora_A' in name:
+            A = param                                        # k x m
+            B_name = name.replace('lora_A', 'lora_B')
+            B = next(p for n, p in model.named_parameters() if n == B_name)  # n x k
 
             if p == 2:
                 # Special case for p=2: use efficient trace method
@@ -137,7 +136,7 @@ def compute_lp_regularization(model, p = 2):
                 norm = torch.sum(torch.abs(BA) ** p)
 
             # Divide by p to cancel out the derivative pulling the power down.
-            total_norm += ((1.0 / p) * norm_p).to(device)
+            total_norm += (1.0 / p) * norm
             lora_count += 1
 
     if torch.isnan(total_norm):
@@ -343,37 +342,12 @@ class CustomPipelineEngine(PipelineEngine):
         if hasattr(self.module, '_layer_specs'):
             orthogonality_lambda = self.module._layer_specs[-1].module_kwargs.get('orthogonality_lambda', 0)
         
-        # This version has each node computer their own copy of this:
-        # - Redundant calculation.
-        # - Less network bandwidth.
+        # Have each rank compute the regularization term independently on its own collection of tensors
         if orthogonality_lambda > 0:
             ortho_reg_norm, ortho_reg_count = compute_orthogonality_regularization(self.module)
         else:
             ortho_reg_norm = torch.tensor(0.0, device=self.device)
             ortho_reg_count = torch.tensor(0.0, device=self.device)
-   
-        # Alternative version: only computes regularization on the first rank and broadcasts
-        """
-        if orthogonality_lambda > 0:
-            # Get data parallel group and rank
-            dp_group = self.grid.get_data_parallel_group()
-            dp_rank = dist.get_rank(group=dp_group)
-            
-            # Initialize ortho_reg_norm and ortho_reg_count
-            ortho_reg_norm = torch.tensor(0.0, device=self.device)
-            ortho_reg_count = torch.tensor(0.0, device=self.device)
-            
-            # Compute ortho_reg on the first rank in the DP group
-            if dp_rank == 0:
-                ortho_reg_norm, ortho_reg_count = compute_orthogonality_regularization(self.module)
-            
-            # Broadcast ortho_reg_norm and ortho_reg_count to all DP ranks
-            dist.broadcast(ortho_reg_norm, src=0, group=dp_group)
-            dist.broadcast(ortho_reg_count, src=0, group=dp_group)
-        else:
-            ortho_reg_norm = torch.tensor(0.0, device=self.device)
-            ortho_reg_count = torch.tensor(0.0, device=self.device)
-        """
         
         # Accumulate orthogonality regularization
         total_ortho_reg_norm = ortho_reg_prev_norm + ortho_reg_norm
