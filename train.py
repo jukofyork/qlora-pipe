@@ -217,6 +217,87 @@ def apply_max_norm_regularization(model, config):
     return keys_scaled, avg_norm, max_norm, norms
 
 
+def apply_decoupled_orthogonality_regularization(model, config):
+    """
+    Computes approximation of ||CᵗC - I||_F², where C = I + BA:
+    - Full expansion is ||BA + AB + (BA)(AB)||_F²
+    - For small-norm ||A||,||B|| we approximate using just ||BA + AB||_F²
+    - This expands to ||BA||_F² + ||AB||_F² + 2⟨BA,AB⟩ = 2||AB||_F² + 2Tr(AAᵗBᵗB)
+    
+    Computationally, this approximation exploits that BA has rank ≤ k (k << n):
+    - Approximate version is O(nk²), full expansion would be O(n³) due to (BA)(AB) term.
+    - Avoids O(n³) operations of computing full ||CᵗC - I||²_F
+    - Captures main effects in k-dim subspace spanned by A,B
+    - Valid since BA≈0 outside this subspace due to low rank
+    
+    Numerically, this is a good approximation when ||A||,||B|| are small (< 1):
+    - The two retained terms are both O(||A||⁴,||B||⁴)
+    - The dropped (BA)(AB) term is O(||A||⁸,||B||⁸)
+    - When ||A||,||B|| are large (>> 1), the dropped term starts to dominate though...
+    
+    The two retained terms have distinct interpretations:
+    1. ||AB||_F²
+       - Cross-covariance term penalising scaling
+       - AB is the k x k cross-covariance matrix
+       - Measures magnitude/energy of the k x k transformation AB
+       - Large values indicate BA is scaling vectors up/down too much
+    2. Tr(AAᵗBᵗB)
+       - Covariance alignment term penalising shearing/skewing
+       - AAᵗ and BᵗB are the k x k covariance matrices
+       - Their product/trace measures non-orthogonal rotation effects
+       - Large values mean BA introduces unwanted shearing/skewing
+    """
+    norms = []
+    keys_scaled = 0
+    lora_scale = config['lora_alpha'] / config['lora_rank']
+    
+    for name, param in model.named_parameters():
+        if 'lora_A' in name:
+            A = param
+            B_name = name.replace('lora_A', 'lora_B')
+            B = next(p for n, p in model.named_parameters() if n == B_name)
+
+            # Enable gradient calculation for A and B
+            orthogonality_lambda = config.get('orthogonality_lambda', 0),
+            if orthogonality_lambda > 0:
+                A.requires_grad_(True)
+                B.requires_grad_(True)
+
+            # Compute the orthogonality regularization term
+            # For this example, we'll use the approximate method you provided
+            AB = lora_scale * (A @ B)  # Shape: k x k
+            AB_norm_sq = torch.norm(AB, p='fro') ** 2
+            AAt = lora_scale * (A @ A.T)  # k x k
+            BtB = lora_scale * (B.T @ B)  # k x k
+            trace_AAt_BtB = torch.trace(AAt @ BtB)
+            E_norm_sq = 2 * AB_norm_sq + 2 * trace_AAt_BtB
+
+            # NOTE: sqrt(E_norm²) better for plotting...
+            norms.append(torch.sqrt(E_norm_sq).item())
+            
+            if orthogonality_lambda > 0:                
+                E_norm_sq.backward()
+                with torch.no_grad():
+                    A -= orthogonality_lambda * A.grad
+                    B -= orthogonality_lambda * B.grad
+                A.grad = None
+                B.grad = None
+                A.requires_grad_(False)
+                B.requires_grad_(False)
+                keys_scaled += 1
+
+    if len(norms) > 0:
+        norms = torch.tensor(norms, dtype=torch.float32)
+        if torch.any(torch.isnan(norms)):
+            raise RuntimeError(f'NaN detected in norms, probably some/all weights are NaN')
+        avg_norm = sum(norms) / len(norms)
+        max_norm = max(norms)
+    else:
+        avg_norm = 0
+        max_norm = 0
+    return keys_scaled, avg_norm, max_norm, norms
+
+
 def parse_layers_to_transform(spec):
     parts = spec.split(',')
     result = []
@@ -612,7 +693,8 @@ if __name__ == '__main__':
         metrics = model_engine.train_batch()
         train_dataloader.sync_epoch()
         if lora_config is not None:
-            keys_scaled, avg_norm, max_norm, norms = apply_max_norm_regularization(pipeline_model, config)
+            #keys_scaled, avg_norm, max_norm, norms = apply_max_norm_regularization(pipeline_model, config)
+            keys_scaled, avg_norm, max_norm, norms = apply_decoupled_orthogonality_regularization(pipeline_model, config)
 
         epoch = saver.process_epoch(epoch, step)
         if epoch is None:
