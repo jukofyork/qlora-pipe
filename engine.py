@@ -118,9 +118,8 @@ def compute_orthogonality_regularization(model):
 
     This avoids operations on large n x n matrices and is efficient when k << n.
     
-    **BUT** This suffers from underflow when trace(MN) < 1, so then we switch to:
-    
-    An approximate version which is good when ||A|| and ||B|| are small (< 1):
+    **BUT** This suffers from underflow when trace(AAᵗBᵗB) < 1, so then we switch to an
+            approximate version which is good when ||A|| and ||B|| are small (< 1):
     
     Computes approximation of ||CᵗC - I||_F², where C = I + BA:
     - Full expansion is ||BA + AB + (BA)(AB)||_F²
