@@ -208,6 +208,62 @@ def compute_orthogonality_regularization_exact_2(model):
     # Return sum and count, as these will be accumulated over pipeline stages
     return total_norm, lora_count
 
+# This almost works, but between 0.1 and 10 we get slight instability compared to naive method...
+def compute_orthogonality_regularization_exact_3(model):
+    """
+    Computes ||CᵗC - I||_F² using a dynamic approach:
+    - Computes trace(MN) and determines whether numerical underflow is likely.
+    - If underflow is detected (trace(MN) is below threshold), switches to the approximate method.
+    - Otherwise, uses the efficient exact method.
+    """
+    lora_scale = 1.0  # Adjust as needed
+    total_norm = 0.0
+    lora_count = 0
+
+    for name, param in model.named_parameters():
+        if 'lora_A' in name:
+            A = param  # Adjust dimensions if needed
+            B_name = name.replace('lora_A', 'lora_B')
+            B = next(p for n, p in model.named_parameters() if n == B_name)
+
+            # Apply scaling as necessary
+            A_scaled = lora_scale * A
+            B_scaled = lora_scale * B
+
+            # Compute M and N (k x k matrices)
+            M = A_scaled @ A_scaled.T  # k x k
+            N = B_scaled.T @ B_scaled  # k x k
+
+            # Compute MN and its square
+            MN = M @ N
+            MN_squared = MN @ MN
+
+            # Compute traces
+            trace_MN = torch.trace(MN)
+            trace_MN_squared = torch.trace(MN_squared)
+
+            # Check for potential underflow
+            if trace_MN.abs().item() < 1:
+                # Underflow likely, switch to approximate method
+                AB = A_scaled @ B_scaled  # Adjust dimensions if needed
+                AB_norm_sq = torch.norm(AB, p='fro') ** 2
+                AAt = A_scaled @ A_scaled.T
+                BtB = B_scaled.T @ B_scaled
+                trace_AAt_BtB = torch.trace(AAt @ BtB)
+                E_norm_sq = 2 * AB_norm_sq + 2 * trace_AAt_BtB
+            else:
+                # Compute exact norm
+                n = B_scaled.shape[0]
+                E_norm_sq = trace_MN_squared - 2 * trace_MN + n
+
+            total_norm += E_norm_sq.item()
+            lora_count += 1
+
+    if torch.isnan(torch.tensor(total_norm)):
+        raise RuntimeError('NaN detected in norm calculation, possibly due to numerical issues')
+
+    return total_norm, lora_count
+
 
 def compute_lp_regularization(model, p = 2):
     """Computes Lp-Regularisation (aka "Power Ridge Regression" or "Bridge Regression")
