@@ -217,7 +217,7 @@ def apply_max_norm_regularization(model, config):
     return keys_scaled, avg_norm, max_norm, norms
 
 
-def apply_decoupled_orthogonality_regularization(model, config):
+def apply_decoupled_orthogonality_regularization(model, config, current_lr):
     """
     Computes approximation of ||CᵗC - I||_F², where C = I + BA:
     - Full expansion is ||BA + AB + (BA)(AB)||_F²
@@ -248,7 +248,6 @@ def apply_decoupled_orthogonality_regularization(model, config):
        - Large values mean BA introduces unwanted shearing/skewing
     """
     norms = []
-    keys_scaled = 0
     lora_scale = config['lora_alpha'] / config['lora_rank']
     
     for name, param in model.named_parameters():
@@ -258,7 +257,7 @@ def apply_decoupled_orthogonality_regularization(model, config):
             B = next(p for n, p in model.named_parameters() if n == B_name)
 
             # Enable gradient calculation for A and B
-            orthogonality_lambda = config.get('orthogonality_lambda', 0),
+            orthogonality_lambda = config.get('orthogonality_lambda', 0)
             if orthogonality_lambda > 0:
                 A.requires_grad_(True)
                 B.requires_grad_(True)
@@ -278,13 +277,12 @@ def apply_decoupled_orthogonality_regularization(model, config):
             if orthogonality_lambda > 0:                
                 E_norm_sq.backward()
                 with torch.no_grad():
-                    A -= orthogonality_lambda * A.grad
-                    B -= orthogonality_lambda * B.grad
+                    A -= current_lr * orthogonality_lambda * A.grad
+                    B -= current_lr * orthogonality_lambda * B.grad
                 A.grad = None
                 B.grad = None
                 A.requires_grad_(False)
                 B.requires_grad_(False)
-                keys_scaled += 1
 
     if len(norms) > 0:
         norms = torch.tensor(norms, dtype=torch.float32)
@@ -295,7 +293,7 @@ def apply_decoupled_orthogonality_regularization(model, config):
     else:
         avg_norm = 0
         max_norm = 0
-    return keys_scaled, avg_norm, max_norm, norms
+    return avg_norm, max_norm, norms
 
 
 def parse_layers_to_transform(spec):
@@ -693,8 +691,9 @@ if __name__ == '__main__':
         metrics = model_engine.train_batch()
         train_dataloader.sync_epoch()
         if lora_config is not None:
-            #keys_scaled, avg_norm, max_norm, norms = apply_max_norm_regularization(pipeline_model, config)
             keys_scaled, avg_norm, max_norm, norms = apply_decoupled_orthogonality_regularization(pipeline_model, config)
+            current_lr = model_engine.optimizer.param_groups[0]['lr']
+            avg_ortho_norm, max_ortho_norm, ortho_norms = apply_max_norm_regularization(pipeline_model, config, current_lr)
 
         epoch = saver.process_epoch(epoch, step)
         if epoch is None:
@@ -709,6 +708,9 @@ if __name__ == '__main__':
                 tb_writer.add_scalar('train/avg_weight_norm', avg_norm, step)
                 tb_writer.add_scalar('train/max_weight_norm', max_norm, step)
                 tb_writer.add_histogram('train/weight_norm_hist', norms, step)
+                tb_writer.add_scalar('train/avg_ortho_norm', avg_ortho_norm, step)
+                tb_writer.add_scalar('train/max_ortho_norm', max_ortho_norm, step)
+                tb_writer.add_histogram('train/ortho_norm_hist', ortho_norms, step)
             tb_writer.add_scalar('train/epoch', step/steps_per_epoch, step)
 
         if step % config['eval_steps'] == 0:
