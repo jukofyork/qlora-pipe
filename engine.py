@@ -103,6 +103,112 @@ def compute_orthogonality_regularization(model):
     return total_norm, lora_count
 
 
+# NOTE: This works, but trace((MN)^2) causes underflow for low-norm input matrices and
+#       the output just ends up as `n` due to the `+ n` dominating...
+def compute_orthogonality_regularization_exact_1(model):
+    """
+    Computes the exact value of ||CᵗC - I||_F² in an efficient manner, where C = I + BA.
+
+    By expressing the norm in terms of smaller k × k matrices:
+      - Compute M = A @ A.T (size k x k)
+      - Compute N = B.T @ B (size k x k)
+      - Compute MN = M @ N (size k x k)
+      - Compute trace(MN) and trace((MN)^2)
+
+    Then, the norm is computed as:
+      ||CᵗC - I||_F² = trace((MN)^2) - 2 * trace(MN) + n
+
+    This avoids operations on large n x n matrices and is efficient when k << n.
+    """
+    lora_scale = 1.0  # TODO: Pass in same way as orthogonality_lambda via ComputeMetrics
+    total_norm = 0.0
+    lora_count = 0
+
+    for name, param in model.named_parameters():
+        if 'lora_A' in name:
+            A = param  # k x n
+            B_name = name.replace('lora_A', 'lora_B')
+            B = next(p for n, p in model.named_parameters() if n == B_name)  # n x k
+
+            # Apply scaling if necessary
+            A_scaled = lora_scale * A
+            B_scaled = lora_scale * B
+
+            # Compute M and N (k x k matrices)
+            M = A_scaled @ A_scaled.T  # k x k
+            N = B_scaled.T @ B_scaled  # k x k
+
+            # Compute MN and its square
+            MN = M @ N  # k x k
+            MN_squared = MN @ MN  # k x k
+
+            # Compute the traces
+            trace_MN = torch.trace(MN)
+            trace_MN_squared = torch.trace(MN_squared)
+
+            # Compute n, the size of the identity matrix I
+            n = B.shape[0]
+
+            # Compute the exact norm
+            E_norm_sq_exact = trace_MN_squared - 2 * trace_MN + n
+
+            total_norm += E_norm_sq_exact
+            lora_count += 1
+
+    if torch.isnan(total_norm):
+        raise RuntimeError('NaN detected in norm calculation, probably some/all weights are NaN')
+
+    # Return sum and count, as these will be accumulated over the pipeline stages
+    return total_norm, lora_count
+
+
+# NOTE: This works but has to materialise the n x n matrices...
+def compute_orthogonality_regularization_exact_2(model):
+    """
+    Computes the exact value of ||CᵗC - I||_F² using an alternative computation
+    that avoids numerical underflow by directly computing small terms.
+
+    Method:
+        - Compute BA = B @ A (size n x n)
+        - Compute BA_symm = BA + BA.T + BA.T @ BA
+        - Compute ||BA_symm||_F²
+
+    Note: This method involves computations with large n x n matrices, which may
+    increase computational cost and memory usage when n is large.
+    """
+    lora_scale = 1.0  # TODO: Pass in same way as orthogonality_lambda via ComputeMetrics
+    total_norm = 0.0
+    lora_count = 0
+
+    for name, param in model.named_parameters():
+        if 'lora_A' in name:
+            A = param  # k x n
+            B_name = name.replace('lora_A', 'lora_B')
+            B = next(p for n, p in model.named_parameters() if n == B_name)  # n x k
+
+            # Apply scaling if necessary
+            A_scaled = lora_scale * A
+            B_scaled = lora_scale * B
+
+            # Compute BA (n x n matrix)
+            BA = B_scaled @ A_scaled  # n x n
+
+            # Compute BA_symm = BA + BA.T + BA.T @ BA
+            BA_symm = BA + BA.T + BA.T @ BA  # n x n
+
+            # Compute the Frobenius norm squared
+            E_norm_sq_exact = torch.norm(BA_symm, p='fro') ** 2
+
+            total_norm += E_norm_sq_exact.item()
+            lora_count += 1
+
+    if torch.isnan(torch.tensor(total_norm)):
+        raise RuntimeError('NaN detected in norm calculation, probably some/all weights are NaN')
+
+    # Return sum and count, as these will be accumulated over pipeline stages
+    return total_norm, lora_count
+
+
 def compute_lp_regularization(model, p = 2):
     """Computes Lp-Regularisation (aka "Power Ridge Regression" or "Bridge Regression")
     
