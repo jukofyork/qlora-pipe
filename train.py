@@ -172,52 +172,48 @@ def evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accu
 
 def apply_max_norm_regularization(model, config):
     # modifed from https://github.com/kohya-ss/sd-scripts/blob/main/networks/lora.py
-    A_keys = []
-    B_keys = []
     norms = []
     keys_scaled = 0
     lora_scale = config['lora_alpha'] / config['lora_rank']
 
-    state_dict = model.state_dict()
-    for key in state_dict.keys():
-        if 'lora_A' in key:
-            A_keys.append(key)
-            B_keys.append(key.replace('lora_A', 'lora_B'))
+    for name, param in model.named_parameters():
+        if 'lora_A' in name:
+            A = param
+            B_name = name.replace('lora_A', 'lora_B')
+            B = next(p for n, p in model.named_parameters() if n == B_name)
+            
+            BA = lora_scale * (B @ A)  # n x m
 
-    for i in range(len(A_keys)):
-        A = state_dict[A_keys[i]]
-        B = state_dict[B_keys[i]]
-        W = B @ A
-        W *= lora_scale
+            BA_norm = BA.norm()
 
-        if 'scale_weight_norms' in config:
-            max_norm = config['scale_weight_norms']
-            norm = W.norm().clamp(min=max_norm / 2)
-            desired = torch.clamp(norm, max=max_norm)
-            ratio = desired.cpu() / norm.cpu()
-            sqrt_ratio = ratio**0.5
-            if ratio != 1:
-                keys_scaled += 1
-                state_dict[A_keys[i]] *= sqrt_ratio
-                state_dict[B_keys[i]] *= sqrt_ratio
-        else:
-            ratio = 1.0
-        scalednorm = W.norm() * ratio
-        norms.append(scalednorm.item())
+            if 'scale_weight_norms' in config:
+                max_norm = config['scale_weight_norms']
+                norm = BA_norm.clamp(min=max_norm / 2)
+                desired = torch.clamp(norm, max=max_norm)
+                ratio = desired.cpu() / norm.cpu()
+                if ratio != 1:
+                    keys_scaled += 1
+                    sqrt_ratio = ratio**0.5
+                    A.data.mul_(sqrt_ratio)  # In-place multiplication
+                    B.data.mul_(sqrt_ratio)  # In-place multiplication
+                    BA_norm = BA_norm * ratio
+
+            norms.append(BA_norm.item())
 
     if len(norms) > 0:
         norms = torch.tensor(norms, dtype=torch.float32)
         if torch.any(torch.isnan(norms)):
             raise RuntimeError(f'NaN detected in norms, probably some/all weights are NaN')
-        avg_norm = sum(norms) / len(norms)
-        max_norm = max(norms)
+        avg_norm = norms.mean().item()
+        max_norm = norms.max().item()
     else:
+        norms = torch.tensor([])
         avg_norm = 0
         max_norm = 0
     return keys_scaled, avg_norm, max_norm, norms
 
 
-def apply_decoupled_orthogonality_regularization(model, config, current_lr):
+def apply_decoupled_orthogonality_regularization_approx(model, config, current_lr):
     """
     Computes approximation of ||CᵗC - I||_F², where C = I + BA:
     - Full expansion is ||BA + AB + (BA)(AB)||_F²
@@ -253,13 +249,13 @@ def apply_decoupled_orthogonality_regularization(model, config, current_lr):
 
     for name, param in model.named_parameters():
         if 'lora_A' in name:
-            A_original = param  # k x n
+            A_original = param
             B_name = name.replace('lora_A', 'lora_B')
-            B_original = next(p for n, p in model.named_parameters() if n == B_name)  # n x k
+            B_original = next(p for n, p in model.named_parameters() if n == B_name)
             
             # Make detached copies of the parameters
-            A = A_original.detach().clone().requires_grad_(True)
-            B = B_original.detach().clone().requires_grad_(True)
+            A = A_original.detach().clone().requires_grad_(True)  # k x n
+            B = B_original.detach().clone().requires_grad_(True)  # n x k
 
             # Compute the regularization term on copies
             AB = lora_scale * (A @ B)     # k x k
@@ -292,6 +288,8 @@ def apply_decoupled_orthogonality_regularization(model, config, current_lr):
 
     if len(norms) > 0:
         norms = torch.tensor(norms, dtype=torch.float32)
+        if torch.any(torch.isnan(norms)):
+            raise RuntimeError(f'NaN detected in norms, probably some/all weights are NaN')
         avg_norm = norms.mean().item()
         max_norm = norms.max().item()
     else:
@@ -301,6 +299,186 @@ def apply_decoupled_orthogonality_regularization(model, config, current_lr):
 
     return avg_norm, max_norm, norms
 
+def apply_decoupled_orthogonality_regularization_exact(model, config, current_lr):
+    """
+    Computes the exact value of ||CᵗC - I||_F² in an efficient manner, where C = I + BA.
+
+    By expressing the norm in terms of smaller k × k matrices:
+      - Compute AAᵗ = A @ A.T (size k x k)
+      - Compute BᵗB = B.T @ B (size k x k)
+      - Compute AAᵗBᵗB = AAᵗ @ BᵗB (size k x k)
+      - Compute trace(AAᵗBᵗB) and trace((AAᵗBᵗB)²)
+
+    Then, the norm is computed as:
+      ||CᵗC - I||_F² = trace((AAᵗBᵗB)^2) - 2 * trace(AAᵗBᵗB) + n
+
+    This avoids operations on large n x n matrices and is efficient when k << n:
+    - Computing AAᵗ and BᵗB: O(nk²) each
+    - Computing AAᵗBᵗB: O(k³)
+    - Computing traces: O(k)
+    Total complexity: O(nk²) vs O(n³) for naive implementation with full matrices.
+    
+    **BUT**: This suffers from underflow when Tr(AAᵗBᵗB) < sqrt(n), where n is the dimension.
+    This threshold arises because orthogonal matrices in n-dimensional space naturally have 
+    entries of magnitude ~1/sqrt(n) to maintain unit norm columns/rows. This scaling appears 
+    in random orthogonal matrices and has been empirically verified as the optimal switching 
+    point for random normal data. When Tr(AAᵗBᵗB) << sqrt(n), the exact formula becomes 
+    numerically unstable, so:
+    
+    We switch to an approximate version which is good when ||A|| and ||B|| are small (< 1):
+    
+    Computes approximation of ||CᵗC - I||_F², where C = I + BA:
+    - Full expansion is ||BA + AB + (BA)(AB)||_F²
+    - For small-norm ||A||,||B|| we approximate using just ||BA + AB||_F²
+    - This expands to ||BA||_F² + ||AB||_F² + 2⟨BA,AB⟩ = 2||AB||_F² + 2Tr(AAᵗBᵗB)
+    
+    Computationally, this approximation exploits that BA has rank ≤ k (k << n):
+    - Approximate version is O(nk²), full expansion would be O(n³) due to (BA)(AB) term.
+    - Avoids O(n³) operations of computing full ||CᵗC - I||²_F
+    - Captures main effects in k-dim subspace spanned by A,B
+    - Valid since BA≈0 outside this subspace due to low rank
+    
+    Numerically, this is a good approximation when ||A||,||B|| are small (< 1):
+    - The two retained terms are both O(||A||⁴,||B||⁴)
+    - The dropped (BA)(AB) term is O(||A||⁸,||B||⁸)
+    - When ||A||,||B|| are large (>> 1), the dropped term starts to dominate though...
+    
+    The two retained terms have distinct interpretations:
+    1. ||AB||_F²
+       - Cross-covariance term penalising scaling
+       - AB is the k x k cross-covariance matrix
+       - Measures magnitude/energy of the k x k transformation AB
+       - Large values indicate BA is scaling vectors up/down too much
+    2. Tr(AAᵗBᵗB)
+       - Covariance alignment term penalising shearing/skewing
+       - AAᵗ and BᵗB are the k x k covariance matrices
+       - Their product/trace measures non-orthogonal rotation effects
+       - Large values mean BA introduces unwanted shearing/skewing
+    """    
+    norms = []
+    lora_scale = config['lora_alpha'] / config['lora_rank']
+    orthogonality_lambda = config.get('orthogonality_lambda', 0)
+
+    for name, param in model.named_parameters():
+        if 'lora_A' in name:
+            A_original = param
+            B_name = name.replace('lora_A', 'lora_B')
+            B_original = next(p for n, p in model.named_parameters() if n == B_name)
+            
+            # Make detached copies of the parameters
+            A = A_original.detach().clone().requires_grad_(True)  # k x n
+            B = B_original.detach().clone().requires_grad_(True)  # n x k
+
+            AAt = lora_scale * (A @ A.T)  # k x k
+            BtB = lora_scale * (B.T @ B)  # k x k
+
+            AAt_BtB = AAt @ BtB           # k x k
+            
+            trace_AAt_BtB = torch.trace(AAt_BtB)
+            trace_AAt_BtB_squared = torch.trace(AAt_BtB @ AAt_BtB)
+
+            # Check for potential numerical instability
+            n = B.shape[0]
+            if trace_AAt_BtB < torch.sqrt(n):
+                # Switch to approximate method
+                AB = lora_scale * (A @ B)  # k x k
+                AB_norm_sq = torch.norm(AB, p='fro') ** 2
+                E_norm_sq = 2 * AB_norm_sq + 2 * trace_AAt_BtB
+            else:
+                # Compute exact norm
+                E_norm_sq = trace_AAt_BtB_squared - 2 * trace_AAt_BtB + n
+
+            # Compute sqrt(E_norm_sq) for logging
+            norms.append(torch.sqrt(E_norm_sq).item())
+
+            # If regularization is enabled
+            if orthogonality_lambda > 0:
+                # Compute gradients with respect to A and B
+                E_norm_sq.backward()
+
+                # Update the copies using the calculated gradients
+                with torch.no_grad():
+                    A -= current_lr * orthogonality_lambda * A.grad
+                    B -= current_lr * orthogonality_lambda * B.grad
+
+                    # Clear gradients from the copies
+                    A.grad = None
+                    B.grad = None
+
+                # Write the updated copies back to the model parameters
+                A_original.data.copy_(A)
+                B_original.data.copy_(B)
+
+    if len(norms) > 0:
+        norms = torch.tensor(norms, dtype=torch.float32)
+        if torch.any(torch.isnan(norms)):
+            raise RuntimeError(f'NaN detected in norms, probably some/all weights are NaN')
+        avg_norm = norms.mean().item()
+        max_norm = norms.max().item()
+    else:
+        norms = torch.tensor([])
+        avg_norm = 0
+        max_norm = 0
+
+    return avg_norm, max_norm, norms
+
+
+def apply_decoupled_lp_regularization(model, config, current_lr):
+    """Computes Lp-Regularisation (aka "Power Ridge Regression" or "Bridge Regression")
+    
+    Args:
+        model: The model containing LoRA weights
+        p: Power for the norm, must be >= 1 (default=2)
+           p=2 gives Ridge Regression, p=1 gives Lasso
+    
+    See: https://www.stat.cmu.edu/technometrics/90-00/vol-35-02/v3502109.pdf
+    """
+    regularization_lambda = config.get('regularization_lambda', 0)
+    if regularization_lambda <= 0:
+        return
+
+    p = config.get('regularization_p', 0)
+    assert p >= 1, "p<1 is non-convex and not suitable for gradient-based optimization methods"
+
+    lora_scale = config['lora_alpha'] / config['lora_rank']
+    
+    for name, param in model.named_parameters():
+        if 'lora_A' in name:
+            A_original = param
+            B_name = name.replace('lora_A', 'lora_B')
+            B_original = next(p for n, p in model.named_parameters() if n == B_name)
+            
+            # Make detached copies of the parameters
+            A = A_original.detach().clone().requires_grad_(True)  # k x m
+            B = B_original.detach().clone().requires_grad_(True)  # n x k
+
+            if p == 2:
+                # Special case for p=2: use efficient trace method
+                AAt = A @ A.T   # k x k
+                BAAt = B @ AAt  # n x k
+                norm = (lora_scale ** 2 / 2) * torch.trace(BAAt @ B.T)
+            else:
+                # For other p values, need to materialise B @ A
+                BA = lora_scale * B @ A   # n x m
+                norm = (1 / p) * torch.sum(torch.abs(BA) ** p)
+            
+            # Compute gradients with respect to A and B
+            norm.backward()
+
+            # Update the copies using the calculated gradients
+            with torch.no_grad():
+                A -= current_lr * regularization_lambda * A.grad
+                B -= current_lr * regularization_lambda * B.grad
+
+                # Clear gradients from the copies
+                A.grad = None
+                B.grad = None
+
+            # Write the updated copies back to the model parameters
+            A_original.data.copy_(A)
+            B_original.data.copy_(B)
+
+    return
 
 def parse_layers_to_transform(spec):
     parts = spec.split(',')
@@ -698,7 +876,7 @@ if __name__ == '__main__':
         train_dataloader.sync_epoch()
         if lora_config is not None:
             keys_scaled, avg_norm, max_norm, norms = apply_max_norm_regularization(pipeline_model, config)
-            avg_ortho_norm, max_ortho_norm, ortho_norms = apply_decoupled_orthogonality_regularization(
+            avg_ortho_norm, max_ortho_norm, ortho_norms = apply_decoupled_orthogonality_regularization_approx(
                 pipeline_model,
                 config,
                 optimizer.param_groups[0]['lr']
