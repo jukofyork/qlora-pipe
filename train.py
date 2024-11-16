@@ -691,9 +691,12 @@ if __name__ == '__main__':
         metrics = model_engine.train_batch()
         train_dataloader.sync_epoch()
         if lora_config is not None:
-            keys_scaled, avg_norm, max_norm, norms = apply_decoupled_orthogonality_regularization(pipeline_model, config)
-            current_lr = model_engine.optimizer.param_groups[0]['lr']
-            avg_ortho_norm, max_ortho_norm, ortho_norms = apply_max_norm_regularization(pipeline_model, config, current_lr)
+            keys_scaled, avg_norm, max_norm, norms = apply_max_norm_regularization(pipeline_model, config)
+            avg_ortho_norm, max_ortho_norm, ortho_norms = apply_decoupled_orthogonality_regularization(
+                pipeline_model,
+                config,
+                optimizer.param_groups[0]['lr']
+            )
 
         epoch = saver.process_epoch(epoch, step)
         if epoch is None:
