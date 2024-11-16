@@ -45,7 +45,7 @@ def initialize(args=None,
     return engine, engine.optimizer
 
 
-def compute_orthogonality_regularization(model):
+def compute_orthogonality_regularization_approx(model):
     """
     Computes approximation of ||CᵗC - I||_F², where C = I + BA:
     - Full expansion is ||BA + AB + (BA)(AB)||_F²
@@ -103,158 +103,86 @@ def compute_orthogonality_regularization(model):
     return total_norm, lora_count
 
 
-# NOTE: This works, but trace((MN)^2) causes underflow for low-norm input matrices and
-#       the output just ends up as `n` due to the `+ n` dominating...
-def compute_orthogonality_regularization_exact_1(model):
+def compute_orthogonality_regularization(model):
     """
     Computes the exact value of ||CᵗC - I||_F² in an efficient manner, where C = I + BA.
 
     By expressing the norm in terms of smaller k × k matrices:
-      - Compute M = A @ A.T (size k x k)
-      - Compute N = B.T @ B (size k x k)
-      - Compute MN = M @ N (size k x k)
-      - Compute trace(MN) and trace((MN)^2)
+      - Compute AAᵗ = A @ A.T (size k x k)
+      - Compute BᵗB = B.T @ B (size k x k)
+      - Compute AAᵗBᵗB = AAᵗ @ BᵗB (size k x k)
+      - Compute trace(AAᵗBᵗB) and trace((AAᵗBᵗB)^2)
 
     Then, the norm is computed as:
-      ||CᵗC - I||_F² = trace((MN)^2) - 2 * trace(MN) + n
+      ||CᵗC - I||_F² = trace((AAᵗBᵗB)^2) - 2 * trace(AAᵗBᵗB) + n
 
     This avoids operations on large n x n matrices and is efficient when k << n.
+    
+    **BUT** This suffers from underflow when trace(MN) < 1, so then we switch to:
+    
+    An approximate version which is good when ||A|| and ||B|| are small (< 1):
+    
+    Computes approximation of ||CᵗC - I||_F², where C = I + BA:
+    - Full expansion is ||BA + AB + (BA)(AB)||_F²
+    - For small-norm ||A||,||B|| we approximate using just ||BA + AB||_F²
+    - This expands to ||BA||_F² + ||AB||_F² + 2⟨BA,AB⟩ = 2||AB||_F² + 2Tr(AAᵗBᵗB)
+    
+    Computationally, this approximation exploits that BA has rank ≤ k (k << n):
+    - Approximate version is O(nk²), full expansion would be O(n³) due to (BA)(AB) term.
+    - Avoids O(n³) operations of computing full ||CᵗC - I||²_F
+    - Captures main effects in k-dim subspace spanned by A,B
+    - Valid since BA≈0 outside this subspace due to low rank
+    
+    Numerically, this is a good approximation when ||A||,||B|| are small (< 1):
+    - The two retained terms are both O(||A||⁴,||B||⁴)
+    - The dropped (BA)(AB) term is O(||A||⁸,||B||⁸)
+    - When ||A||,||B|| are large (>> 1), the dropped term starts to dominate though...
+    
+    The two retained terms have distinct interpretations:
+    1. ||AB||_F²
+       - Cross-covariance term penalising scaling
+       - AB is the k x k cross-covariance matrix
+       - Measures magnitude/energy of the k x k transformation AB
+       - Large values indicate BA is scaling vectors up/down too much
+    2. Tr(AAᵗBᵗB)
+       - Covariance alignment term penalising shearing/skewing
+       - AAᵗ and BᵗB are the k x k covariance matrices
+       - Their product/trace measures non-orthogonal rotation effects
+       - Large values mean BA introduces unwanted shearing/skewing
     """
     lora_scale = 1.0  # TODO: Pass in same way as orthogonality_lambda via ComputeMetrics
     total_norm = 0.0
     lora_count = 0
 
-    for name, param in model.named_parameters():
-        if 'lora_A' in name:
-            A = param  # k x n
-            B_name = name.replace('lora_A', 'lora_B')
-            B = next(p for n, p in model.named_parameters() if n == B_name)  # n x k
-
-            # Apply scaling if necessary
-            A_scaled = lora_scale * A
-            B_scaled = lora_scale * B
-
-            # Compute M and N (k x k matrices)
-            M = A_scaled @ A_scaled.T  # k x k
-            N = B_scaled.T @ B_scaled  # k x k
-
-            # Compute MN and its square
-            MN = M @ N  # k x k
-            MN_squared = MN @ MN  # k x k
-
-            # Compute the traces
-            trace_MN = torch.trace(MN)
-            trace_MN_squared = torch.trace(MN_squared)
-
-            # Compute n, the size of the identity matrix I
-            n = B.shape[0]
-
-            # Compute the exact norm
-            E_norm_sq_exact = trace_MN_squared - 2 * trace_MN + n
-
-            total_norm += E_norm_sq_exact
-            lora_count += 1
-
-    if torch.isnan(total_norm):
-        raise RuntimeError('NaN detected in norm calculation, probably some/all weights are NaN')
-
-    # Return sum and count, as these will be accumulated over the pipeline stages
-    return total_norm, lora_count
-
-
-# NOTE: This works but has to materialise the n x n matrices...
-def compute_orthogonality_regularization_exact_2(model):
-    """
-    Computes the exact value of ||CᵗC - I||_F² using an alternative computation
-    that avoids numerical underflow by directly computing small terms.
-
-    Method:
-        - Compute BA = B @ A (size n x n)
-        - Compute BA_symm = BA + BA.T + BA.T @ BA
-        - Compute ||BA_symm||_F²
-
-    Note: This method involves computations with large n x n matrices, which may
-    increase computational cost and memory usage when n is large.
-    """
-    lora_scale = 1.0  # TODO: Pass in same way as orthogonality_lambda via ComputeMetrics
-    total_norm = 0.0
-    lora_count = 0
+    lora_scale_sqrt = torch.sqrt(lora_scale)
 
     for name, param in model.named_parameters():
         if 'lora_A' in name:
-            A = param  # k x n
-            B_name = name.replace('lora_A', 'lora_B')
-            B = next(p for n, p in model.named_parameters() if n == B_name)  # n x k
-
-            # Apply scaling if necessary
-            A_scaled = lora_scale * A
-            B_scaled = lora_scale * B
-
-            # Compute BA (n x n matrix)
-            BA = B_scaled @ A_scaled  # n x n
-
-            # Compute BA_symm = BA + BA.T + BA.T @ BA
-            BA_symm = BA + BA.T + BA.T @ BA  # n x n
-
-            # Compute the Frobenius norm squared
-            E_norm_sq_exact = torch.norm(BA_symm, p='fro') ** 2
-
-            total_norm += E_norm_sq_exact.item()
-            lora_count += 1
-
-    if torch.isnan(torch.tensor(total_norm)):
-        raise RuntimeError('NaN detected in norm calculation, probably some/all weights are NaN')
-
-    # Return sum and count, as these will be accumulated over pipeline stages
-    return total_norm, lora_count
-
-# This almost works, but between 0.1 and 10 we get slight instability compared to naive method...
-def compute_orthogonality_regularization_exact_3(model):
-    """
-    Computes ||CᵗC - I||_F² using a dynamic approach:
-    - Computes trace(MN) and determines whether numerical underflow is likely.
-    - If underflow is detected (trace(MN) is below threshold), switches to the approximate method.
-    - Otherwise, uses the efficient exact method.
-    """
-    lora_scale = 1.0  # Adjust as needed
-    total_norm = 0.0
-    lora_count = 0
-
-    for name, param in model.named_parameters():
-        if 'lora_A' in name:
-            A = param  # Adjust dimensions if needed
+            A = param
             B_name = name.replace('lora_A', 'lora_B')
             B = next(p for n, p in model.named_parameters() if n == B_name)
 
-            # Apply scaling as necessary
-            A_scaled = lora_scale * A
-            B_scaled = lora_scale * B
+            A_scaled = lora_scale_sqrt * A  # k x n
+            B_scaled = lora_scale_sqrt * B  # n x k
 
-            # Compute M and N (k x k matrices)
-            M = A_scaled @ A_scaled.T  # k x k
-            N = B_scaled.T @ B_scaled  # k x k
+            AAt = A_scaled @ A_scaled.T     # k x k
+            BtB = B_scaled.T @ B_scaled     # k x k
 
-            # Compute MN and its square
-            MN = M @ N
-            MN_squared = MN @ MN
-
-            # Compute traces
-            trace_MN = torch.trace(MN)
-            trace_MN_squared = torch.trace(MN_squared)
+            AAt_BtB = AAt @ BtB             # k x k
+            
+            trace_AAt_BtB = torch.trace(AAt_BtB)
 
             # Check for potential underflow
-            if trace_MN.abs().item() < 1:
-                # Underflow likely, switch to approximate method
-                AB = A_scaled @ B_scaled  # Adjust dimensions if needed
+            if trace_AAt_BtB.abs().item() < 1:
+                # Switch to approximate method
+                AB = A_scaled @ B_scaled    # k x k
                 AB_norm_sq = torch.norm(AB, p='fro') ** 2
-                AAt = A_scaled @ A_scaled.T
-                BtB = B_scaled.T @ B_scaled
-                trace_AAt_BtB = torch.trace(AAt @ BtB)
                 E_norm_sq = 2 * AB_norm_sq + 2 * trace_AAt_BtB
             else:
                 # Compute exact norm
                 n = B_scaled.shape[0]
-                E_norm_sq = trace_MN_squared - 2 * trace_MN + n
+                AAt_BtB_AAt_BtB = AAt_BtB @ AAt_BtB  # k x k
+                E_norm_sq = torch.trace(AAt_BtB_AAt_BtB) - 2 * trace_AAt_BtB + n
 
             total_norm += E_norm_sq.item()
             lora_count += 1
