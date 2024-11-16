@@ -437,7 +437,7 @@ def apply_decoupled_lp_regularization(model, config, current_lr):
     if regularization_lambda <= 0:
         return
 
-    p = config.get('regularization_p', 0)
+    p = config.get('regularization_p', 2)
     assert p >= 1, "p<1 is non-convex and not suitable for gradient-based optimization methods"
 
     lora_scale = config['lora_alpha'] / config['lora_rank']
@@ -447,6 +447,13 @@ def apply_decoupled_lp_regularization(model, config, current_lr):
             A_original = param
             B_name = name.replace('lora_A', 'lora_B')
             B_original = next(p for n, p in model.named_parameters() if n == B_name)
+            
+            # Get the name of the tensor this LoRA goes with.
+            W_name = name.replace('.lora_A', '')
+            W = next(p for n, p in model.named_parameters() if n == W_name)
+            
+            # Use W's norm to scale the value of lambda
+            scaled_lambda = regularization_lambda * torch.norm(W)
             
             # Make detached copies of the parameters
             A = A_original.detach().clone().requires_grad_(True)  # k x m
@@ -467,8 +474,8 @@ def apply_decoupled_lp_regularization(model, config, current_lr):
 
             # Update the copies using the calculated gradients
             with torch.no_grad():
-                A -= current_lr * regularization_lambda * A.grad
-                B -= current_lr * regularization_lambda * B.grad
+                A -= current_lr * scaled_lambda * A.grad
+                B -= current_lr * scaled_lambda * B.grad
 
                 # Clear gradients from the copies
                 A.grad = None
