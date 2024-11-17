@@ -217,6 +217,203 @@ def apply_max_norm_regularization(model, config):
     return keys_scaled, avg_norm, max_norm, norms
 
 
+def apply_decoupled_orthogonality_regularization_approx(model, config, current_lr, max_lr):
+    """
+    Computes approximation of ||CᵗC - I||_F², where C = I + BA:
+    - Full expansion is ||BA + AB + (BA)(AB)||_F²
+    - For small-norm ||A||,||B|| we approximate using just ||BA + AB||_F²
+    - This expands to ||BA||_F² + ||AB||_F² + 2⟨BA,AB⟩ = 2||AB||_F² + 2Tr(AAᵗBᵗB)
+    
+    Computationally, this approximation exploits that BA has rank ≤ k (k << n):
+    - Approximate version is O(nk²), full expansion would be O(n³) due to (BA)(AB) term.
+    - Avoids O(n³) operations of computing full ||CᵗC - I||²_F
+    - Captures main effects in k-dim subspace spanned by A,B
+    - Valid since BA≈0 outside this subspace due to low rank
+    
+    Numerically, this is a good approximation when ||A||,||B|| are small (< 1):
+    - The two retained terms are both O(||A||⁴,||B||⁴)
+    - The dropped (BA)(AB) term is O(||A||⁸,||B||⁸)
+    - When ||A||,||B|| are large (>> 1), the dropped term starts to dominate though...
+    
+    The two retained terms have distinct interpretations:
+    1. ||AB||_F²
+       - Cross-covariance term penalising scaling
+       - AB is the k x k cross-covariance matrix
+       - Measures magnitude/energy of the k x k transformation AB
+       - Large values indicate BA is scaling vectors up/down too much
+    2. Tr(AAᵗBᵗB)
+       - Covariance alignment term penalising shearing/skewing
+       - AAᵗ and BᵗB are the k x k covariance matrices
+       - Their product/trace measures non-orthogonal rotation effects
+       - Large values mean BA introduces unwanted shearing/skewing
+    """
+    norms = []
+    lora_scale = config['lora_alpha'] / config['lora_rank']
+    orthogonality_lambda = config.get('orthogonality_lambda', 0)
+
+    for name, param in model.named_parameters():
+        if 'lora_A' in name:
+            A = param
+            B_name = name.replace('lora_A', 'lora_B')
+            B = next(p for n, p in model.named_parameters() if n == B_name)
+            
+            # Compute the E_norm_sq regularization term
+            AB = lora_scale * (A @ B)     # k x k
+            AB_norm_sq = torch.norm(AB, p='fro') ** 2
+            AAt = lora_scale * (A @ A.T)  # k x k
+            BtB = lora_scale * (B.T @ B)  # k x k
+            trace_AAt_BtB = torch.trace(AAt @ BtB)
+            E_norm_sq = 2 * AB_norm_sq + 2 * trace_AAt_BtB
+
+            # Compute sqrt(E_norm_sq) for logging
+            norms.append(torch.sqrt(E_norm_sq).item())
+
+            # If regularization is enabled
+            if orthogonality_lambda > 0:
+                # Compute gradients with respect to A and B
+                E_norm_sq.backward()
+
+                # Update the weights in place, using the calculated gradients
+                # See: https://optimi.benjaminwarner.dev/fully_decoupled_weight_decay
+                with torch.no_grad():
+                    A -= (current_lr/max_lr) * orthogonality_lambda * A.grad
+                    B -= (current_lr/max_lr) * orthogonality_lambda * B.grad
+
+                    # Clear gradients after manual update
+                    A.grad = None
+                    B.grad = None
+
+    if len(norms) > 0:
+        norms = torch.tensor(norms, dtype=torch.float32)
+        if torch.any(torch.isnan(norms)):
+            raise RuntimeError(f'NaN detected in norms, probably some/all weights are NaN')
+        avg_norm = norms.mean().item()
+        max_norm = norms.max().item()
+    else:
+        norms = torch.tensor([])
+        avg_norm = 0
+        max_norm = 0
+
+    return avg_norm, max_norm, norms
+
+
+def apply_decoupled_orthogonality_regularization_exact(model, config, current_lr, max_lr):
+    """
+    Computes the exact value of ||CᵗC - I||_F² in an efficient manner, where C = I + BA.
+
+    By expressing the norm in terms of smaller k × k matrices:
+      - Compute AAᵗ = A @ A.T (size k x k)
+      - Compute BᵗB = B.T @ B (size k x k)
+      - Compute AAᵗBᵗB = AAᵗ @ BᵗB (size k x k)
+      - Compute trace(AAᵗBᵗB) and trace((AAᵗBᵗB)²)
+
+    Then, the norm is computed as:
+      ||CᵗC - I||_F² = trace((AAᵗBᵗB)^2) - 2 * trace(AAᵗBᵗB) + n
+
+    This avoids operations on large n x n matrices and is efficient when k << n:
+    - Computing AAᵗ and BᵗB: O(nk²) each
+    - Computing AAᵗBᵗB: O(k³)
+    - Computing traces: O(k)
+    Total complexity: O(nk²) vs O(n³) for naive implementation with full matrices.
+    
+    **BUT**: This suffers from underflow when Tr(AAᵗBᵗB) < sqrt(n), where n is the dimension.
+    This threshold arises because orthogonal matrices in n-dimensional space naturally have 
+    entries of magnitude ~1/sqrt(n) to maintain unit norm columns/rows. This scaling appears 
+    in random orthogonal matrices and has been empirically verified as the optimal switching 
+    point for random normal data. When Tr(AAᵗBᵗB) << sqrt(n), the exact formula becomes 
+    numerically unstable, so:
+    
+    We switch to an approximate version which is good when ||A|| and ||B|| are small (< 1):
+    
+    Computes approximation of ||CᵗC - I||_F², where C = I + BA:
+    - Full expansion is ||BA + AB + (BA)(AB)||_F²
+    - For small-norm ||A||,||B|| we approximate using just ||BA + AB||_F²
+    - This expands to ||BA||_F² + ||AB||_F² + 2⟨BA,AB⟩ = 2||AB||_F² + 2Tr(AAᵗBᵗB)
+    
+    Computationally, this approximation exploits that BA has rank ≤ k (k << n):
+    - Approximate version is O(nk²), full expansion would be O(n³) due to (BA)(AB) term.
+    - Avoids O(n³) operations of computing full ||CᵗC - I||²_F
+    - Captures main effects in k-dim subspace spanned by A,B
+    - Valid since BA≈0 outside this subspace due to low rank
+    
+    Numerically, this is a good approximation when ||A||,||B|| are small (< 1):
+    - The two retained terms are both O(||A||⁴,||B||⁴)
+    - The dropped (BA)(AB) term is O(||A||⁸,||B||⁸)
+    - When ||A||,||B|| are large (>> 1), the dropped term starts to dominate though...
+    
+    The two retained terms have distinct interpretations:
+    1. ||AB||_F²
+       - Cross-covariance term penalising scaling
+       - AB is the k x k cross-covariance matrix
+       - Measures magnitude/energy of the k x k transformation AB
+       - Large values indicate BA is scaling vectors up/down too much
+    2. Tr(AAᵗBᵗB)
+       - Covariance alignment term penalising shearing/skewing
+       - AAᵗ and BᵗB are the k x k covariance matrices
+       - Their product/trace measures non-orthogonal rotation effects
+       - Large values mean BA introduces unwanted shearing/skewing
+    """    
+    norms = []
+    lora_scale = config['lora_alpha'] / config['lora_rank']
+    orthogonality_lambda = config.get('orthogonality_lambda', 0)
+
+    for name, param in model.named_parameters():
+        if 'lora_A' in name:
+            A = param
+            B_name = name.replace('lora_A', 'lora_B')
+            B = next(p for n, p in model.named_parameters() if n == B_name)
+
+            AAt = lora_scale * (A @ A.T)  # k x k
+            BtB = lora_scale * (B.T @ B)  # k x k
+
+            AAt_BtB = AAt @ BtB           # k x k
+            
+            trace_AAt_BtB = torch.trace(AAt_BtB)
+            trace_AAt_BtB_squared = torch.trace(AAt_BtB @ AAt_BtB)
+
+            # Check for potential numerical instability
+            n = B.shape[0]
+            if trace_AAt_BtB < torch.sqrt(n):  ## THIS IS FOR RANDOM GUASSIAN DATA - NOT SURE.... 
+                # Switch to approximate method
+                AB = lora_scale * (A @ B)  # k x k
+                AB_norm_sq = torch.norm(AB, p='fro') ** 2
+                E_norm_sq = 2 * AB_norm_sq + 2 * trace_AAt_BtB
+            else:
+                # Compute exact norm
+                E_norm_sq = trace_AAt_BtB_squared - 2 * trace_AAt_BtB + n
+
+            # Compute sqrt(E_norm_sq) for logging
+            norms.append(torch.sqrt(E_norm_sq).item())
+
+            # If regularization is enabled
+            if orthogonality_lambda > 0:
+                # Compute gradients with respect to A and B
+                E_norm_sq.backward()
+
+                # Update the weights in place, using the calculated gradients
+                # See: https://optimi.benjaminwarner.dev/fully_decoupled_weight_decay
+                with torch.no_grad():
+                    A -= (current_lr/max_lr) * orthogonality_lambda * A.grad
+                    B -= (current_lr/max_lr) * orthogonality_lambda * B.grad
+
+                    # Clear gradients after manual update
+                    A.grad = None
+                    B.grad = None
+
+    if len(norms) > 0:
+        norms = torch.tensor(norms, dtype=torch.float32)
+        if torch.any(torch.isnan(norms)):
+            raise RuntimeError(f'NaN detected in norms, probably some/all weights are NaN')
+        avg_norm = norms.mean().item()
+        max_norm = norms.max().item()
+    else:
+        norms = torch.tensor([])
+        avg_norm = 0
+        max_norm = 0
+
+    return avg_norm, max_norm, norms
+
+
 def parse_layers_to_transform(spec):
     parts = spec.split(',')
     result = []
@@ -614,6 +811,12 @@ if __name__ == '__main__':
         train_dataloader.sync_epoch()
         if lora_config is not None:
             keys_scaled, avg_norm, max_norm, norms = apply_max_norm_regularization(pipeline_model, config)
+            avg_ortho_norm, max_ortho_norm, ortho_norms = apply_decoupled_orthogonality_regularization_approx(
+                pipeline_model,
+                config,
+                optimizer.param_groups[0]['lr'],
+                config['optimizer']['lr']
+            )
 
         epoch = saver.process_epoch(epoch, step)
         if epoch is None:
@@ -628,6 +831,9 @@ if __name__ == '__main__':
                 tb_writer.add_scalar('train/weight_norm_avg', avg_norm, step)
                 tb_writer.add_scalar('train/weight_norm_max', max_norm, step)
                 tb_writer.add_histogram('train/weight_norm_hist', norms, step)
+                tb_writer.add_scalar('train/avg_ortho_norm', avg_ortho_norm, step)
+                tb_writer.add_scalar('train/max_ortho_norm', max_ortho_norm, step)
+                tb_writer.add_histogram('train/ortho_norm_hist', ortho_norms, step)
             tb_writer.add_scalar('train/epoch', step/steps_per_epoch, step)
 
         if step % config['eval_steps'] == 0:
