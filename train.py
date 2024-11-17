@@ -831,8 +831,8 @@ if __name__ == '__main__':
                 tb_writer.add_scalar('train/weight_norm_avg', avg_norm, step)
                 tb_writer.add_scalar('train/weight_norm_max', max_norm, step)
                 tb_writer.add_histogram('train/weight_norm_hist', norms, step)
-                tb_writer.add_scalar('train/avg_ortho_norm', avg_ortho_norm, step)
-                tb_writer.add_scalar('train/max_ortho_norm', max_ortho_norm, step)
+                tb_writer.add_scalar('train/ortho_norm_avg', avg_ortho_norm, step)
+                tb_writer.add_scalar('train/ortho_norm_max', max_ortho_norm, step)
                 tb_writer.add_histogram('train/ortho_norm_hist', ortho_norms, step)
             tb_writer.add_scalar('train/epoch', step/steps_per_epoch, step)
 
