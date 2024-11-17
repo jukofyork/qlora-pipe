@@ -194,8 +194,9 @@ def apply_max_norm_regularization(model, config):
                 if ratio != 1:
                     keys_scaled += 1
                     sqrt_ratio = ratio**0.5
-                    A.data.mul_(sqrt_ratio)  # In-place multiplication
-                    B.data.mul_(sqrt_ratio)  # In-place multiplication
+                    with torch.no_grad():
+                        A.data.mul_(sqrt_ratio)
+                        B.data.mul_(sqrt_ratio)
                     BA_norm = BA_norm * ratio
 
             norms.append(BA_norm.item())
@@ -213,7 +214,7 @@ def apply_max_norm_regularization(model, config):
     return keys_scaled, avg_norm, max_norm, norms
 
 
-def apply_decoupled_orthogonality_regularization_approx(model, config, current_lr):
+def apply_decoupled_orthogonality_regularization_approx(model, config, current_lr, max_lr):
     """
     Computes approximation of ||CᵗC - I||_F², where C = I + BA:
     - Full expansion is ||BA + AB + (BA)(AB)||_F²
@@ -249,15 +250,11 @@ def apply_decoupled_orthogonality_regularization_approx(model, config, current_l
 
     for name, param in model.named_parameters():
         if 'lora_A' in name:
-            A_original = param
+            A = param
             B_name = name.replace('lora_A', 'lora_B')
-            B_original = next(p for n, p in model.named_parameters() if n == B_name)
+            B = next(p for n, p in model.named_parameters() if n == B_name)
             
-            # Make detached copies of the parameters
-            A = A_original.detach().clone().requires_grad_(True)  # k x n
-            B = B_original.detach().clone().requires_grad_(True)  # n x k
-
-            # Compute the regularization term on copies
+            # Compute the E_norm_sq regularization term
             AB = lora_scale * (A @ B)     # k x k
             AB_norm_sq = torch.norm(AB, p='fro') ** 2
             AAt = lora_scale * (A @ A.T)  # k x k
@@ -273,18 +270,15 @@ def apply_decoupled_orthogonality_regularization_approx(model, config, current_l
                 # Compute gradients with respect to A and B
                 E_norm_sq.backward()
 
-                # Update the copies using the calculated gradients
+                # Update the weights in place, using the calculated gradients
+                # See: https://optimi.benjaminwarner.dev/fully_decoupled_weight_decay
                 with torch.no_grad():
-                    A -= current_lr * orthogonality_lambda * A.grad
-                    B -= current_lr * orthogonality_lambda * B.grad
+                    A -= (current_lr/max_lr) * orthogonality_lambda * A.grad
+                    B -= (current_lr/max_lr) * orthogonality_lambda * B.grad
 
-                    # Clear gradients from the copies
+                    # Clear gradients after manual update
                     A.grad = None
                     B.grad = None
-
-                # Write the updated copies back to the model parameters
-                A_original.data.copy_(A)
-                B_original.data.copy_(B)
 
     if len(norms) > 0:
         norms = torch.tensor(norms, dtype=torch.float32)
@@ -299,7 +293,7 @@ def apply_decoupled_orthogonality_regularization_approx(model, config, current_l
 
     return avg_norm, max_norm, norms
 
-def apply_decoupled_orthogonality_regularization_exact(model, config, current_lr):
+def apply_decoupled_orthogonality_regularization_exact(model, config, current_lr, max_lr):
     """
     Computes the exact value of ||CᵗC - I||_F² in an efficient manner, where C = I + BA.
 
@@ -361,13 +355,9 @@ def apply_decoupled_orthogonality_regularization_exact(model, config, current_lr
 
     for name, param in model.named_parameters():
         if 'lora_A' in name:
-            A_original = param
+            A = param
             B_name = name.replace('lora_A', 'lora_B')
-            B_original = next(p for n, p in model.named_parameters() if n == B_name)
-            
-            # Make detached copies of the parameters
-            A = A_original.detach().clone().requires_grad_(True)  # k x n
-            B = B_original.detach().clone().requires_grad_(True)  # n x k
+            B = next(p for n, p in model.named_parameters() if n == B_name)
 
             AAt = lora_scale * (A @ A.T)  # k x k
             BtB = lora_scale * (B.T @ B)  # k x k
@@ -379,7 +369,7 @@ def apply_decoupled_orthogonality_regularization_exact(model, config, current_lr
 
             # Check for potential numerical instability
             n = B.shape[0]
-            if trace_AAt_BtB < torch.sqrt(n):
+            if trace_AAt_BtB < torch.sqrt(n):  ## THIS IS FOR RANDOM GUASSIAN DATA - NOT SURE.... 
                 # Switch to approximate method
                 AB = lora_scale * (A @ B)  # k x k
                 AB_norm_sq = torch.norm(AB, p='fro') ** 2
@@ -396,18 +386,15 @@ def apply_decoupled_orthogonality_regularization_exact(model, config, current_lr
                 # Compute gradients with respect to A and B
                 E_norm_sq.backward()
 
-                # Update the copies using the calculated gradients
+                # Update the weights in place, using the calculated gradients
+                # See: https://optimi.benjaminwarner.dev/fully_decoupled_weight_decay
                 with torch.no_grad():
-                    A -= current_lr * orthogonality_lambda * A.grad
-                    B -= current_lr * orthogonality_lambda * B.grad
+                    A -= (current_lr/max_lr) * orthogonality_lambda * A.grad
+                    B -= (current_lr/max_lr) * orthogonality_lambda * B.grad
 
-                    # Clear gradients from the copies
+                    # Clear gradients after manual update
                     A.grad = None
                     B.grad = None
-
-                # Write the updated copies back to the model parameters
-                A_original.data.copy_(A)
-                B_original.data.copy_(B)
 
     if len(norms) > 0:
         norms = torch.tensor(norms, dtype=torch.float32)
@@ -423,7 +410,7 @@ def apply_decoupled_orthogonality_regularization_exact(model, config, current_lr
     return avg_norm, max_norm, norms
 
 
-def apply_decoupled_lp_regularization(model, config, current_lr):
+def apply_decoupled_lp_regularization(model, config, current_lr, max_lr):
     """Computes Lp-Regularisation (aka "Power Ridge Regression" or "Bridge Regression")
     
     Args:
@@ -444,20 +431,33 @@ def apply_decoupled_lp_regularization(model, config, current_lr):
     
     for name, param in model.named_parameters():
         if 'lora_A' in name:
-            A_original = param
+            A = param
             B_name = name.replace('lora_A', 'lora_B')
-            B_original = next(p for n, p in model.named_parameters() if n == B_name)
+            B = next(p for n, p in model.named_parameters() if n == B_name)
             
+            # Not sure if this will work with quantized tensors?
+            """
             # Get the name of the tensor this LoRA goes with.
             W_name = name.replace('.lora_A', '')
             W = next(p for n, p in model.named_parameters() if n == W_name)
             
             # Use W's norm to scale the value of lambda
             scaled_lambda = regularization_lambda * torch.norm(W)
+            """
             
-            # Make detached copies of the parameters
-            A = A_original.detach().clone().requires_grad_(True)  # k x m
-            B = B_original.detach().clone().requires_grad_(True)  # n x k
+            # This *may* work, but not sure yet... Seems dumb to do this every step though?
+            """
+            # Get the name of the tensor this LoRA goes with.
+            W_name = name.replace('.lora_A', '')
+            W = next(p for n, p in model.named_parameters() if n == W_name)
+            
+            # Dequantize if W is a quantized tensor
+            if hasattr(W, 'dequantize'):
+                W = W.dequantize()
+
+             # Use W's norm to scale the value of lambda
+            scaled_lambda = regularization_lambda * torch.norm(W)           
+            """
 
             if p == 2:
                 # Special case for p=2: use efficient trace method
@@ -472,18 +472,15 @@ def apply_decoupled_lp_regularization(model, config, current_lr):
             # Compute gradients with respect to A and B
             norm.backward()
 
-            # Update the copies using the calculated gradients
+            # Update the weights in place, using the calculated gradients
+            # See: https://optimi.benjaminwarner.dev/fully_decoupled_weight_decay
             with torch.no_grad():
-                A -= current_lr * scaled_lambda * A.grad
-                B -= current_lr * scaled_lambda * B.grad
+                A -= (current_lr/max_lr) * regularization_lambda * A.grad
+                B -= (current_lr/max_lr) * regularization_lambda * B.grad
 
-                # Clear gradients from the copies
+                # Clear gradients after manual update
                 A.grad = None
                 B.grad = None
-
-            # Write the updated copies back to the model parameters
-            A_original.data.copy_(A)
-            B_original.data.copy_(B)
 
     return
 
@@ -886,7 +883,8 @@ if __name__ == '__main__':
             avg_ortho_norm, max_ortho_norm, ortho_norms = apply_decoupled_orthogonality_regularization_approx(
                 pipeline_model,
                 config,
-                optimizer.param_groups[0]['lr']
+                optimizer.param_groups[0]['lr'],
+                optim_config['lr']
             )
 
         epoch = saver.process_epoch(epoch, step)
