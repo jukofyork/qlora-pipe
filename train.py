@@ -219,10 +219,10 @@ def apply_max_norm_regularization(model, config):
 
 def apply_decoupled_orthogonality_regularization_approx(model, config, current_lr, max_lr):
     """
-    Computes approximation of ||CᵗC - I||_F², where C = I + BA:
-    - Full expansion is ||BA + AB + (BA)(AB)||_F²
-    - For small-norm ||A||,||B|| we approximate using just ||BA + AB||_F²
-    - This expands to ||BA||_F² + ||AB||_F² + 2⟨BA,AB⟩ = 2||AB||_F² + 2Tr(AAᵗBᵗB)
+    Computes approximation of ½||CᵗC - I||_F², where C = I + BA:
+    - Full expansion is ½||BA + AB + (BA)(AB)||_F²
+    - For small-norm ||A||,||B|| we approximate using just ½||BA + AB||_F²
+    - This expands to ½(||BA||_F² + ||AB||_F² + 2⟨BA,AB⟩) = ||AB||_F² + Tr(AAᵗBᵗB)
     
     Computationally, this approximation exploits that BA has rank ≤ k (k << n):
     - Approximate version is O(nk²), full expansion would be O(n³) due to (BA)(AB) term.
@@ -263,7 +263,7 @@ def apply_decoupled_orthogonality_regularization_approx(model, config, current_l
             AAt = lora_scale * (A @ A.T)  # k x k
             BtB = lora_scale * (B.T @ B)  # k x k
             trace_AAt_BtB = torch.trace(AAt @ BtB)
-            E_norm_sq = 2 * AB_norm_sq + 2 * trace_AAt_BtB
+            E_norm_sq = AB_norm_sq + trace_AAt_BtB
 
             # Compute sqrt(E_norm_sq) for logging
             norms.append(torch.sqrt(E_norm_sq).item())
@@ -304,7 +304,7 @@ def apply_decoupled_orthogonality_regularization_approx(model, config, current_l
 
 def apply_decoupled_orthogonality_regularization_exact(model, config, current_lr, max_lr):
     """
-    Computes the exact value of ||CᵗC - I||_F² in an efficient manner, where C = I + BA.
+    Computes the exact value of ½||CᵗC - I||_F² in an efficient manner, where C = I + BA.
 
     By expressing the norm in terms of smaller k × k matrices:
       - Compute AAᵗ = A @ A.T (size k x k)
@@ -313,7 +313,7 @@ def apply_decoupled_orthogonality_regularization_exact(model, config, current_lr
       - Compute trace(AAᵗBᵗB) and trace((AAᵗBᵗB)²)
 
     Then, the norm is computed as:
-      ||CᵗC - I||_F² = trace((AAᵗBᵗB)^2) - 2 * trace(AAᵗBᵗB) + n
+      ½||CᵗC - I||_F² = ½(trace((AAᵗBᵗB)^2) + n) - trace(AAᵗBᵗB)
 
     This avoids operations on large n x n matrices and is efficient when k << n:
     - Computing AAᵗ and BᵗB: O(nk²) each
@@ -330,10 +330,10 @@ def apply_decoupled_orthogonality_regularization_exact(model, config, current_lr
     
     We switch to an approximate version which is good when ||A|| and ||B|| are small (< 1):
     
-    Computes approximation of ||CᵗC - I||_F², where C = I + BA:
-    - Full expansion is ||BA + AB + (BA)(AB)||_F²
-    - For small-norm ||A||,||B|| we approximate using just ||BA + AB||_F²
-    - This expands to ||BA||_F² + ||AB||_F² + 2⟨BA,AB⟩ = 2||AB||_F² + 2Tr(AAᵗBᵗB)
+    Computes approximation of ½||CᵗC - I||_F², where C = I + BA:
+    - Full expansion is ½||BA + AB + (BA)(AB)||_F²
+    - For small-norm ||A||,||B|| we approximate using just ½||BA + AB||_F²
+    - This expands to ½(||BA||_F² + ||AB||_F² + 2⟨BA,AB⟩) = ||AB||_F² + Tr(AAᵗBᵗB)
     
     Computationally, this approximation exploits that BA has rank ≤ k (k << n):
     - Approximate version is O(nk²), full expansion would be O(n³) due to (BA)(AB) term.
@@ -382,10 +382,10 @@ def apply_decoupled_orthogonality_regularization_exact(model, config, current_lr
                 # Switch to approximate method
                 AB = lora_scale * (A @ B)  # k x k
                 AB_norm_sq = torch.norm(AB, p='fro') ** 2
-                E_norm_sq = 2 * AB_norm_sq + 2 * trace_AAt_BtB
+                E_norm_sq = AB_norm_sq + trace_AAt_BtB
             else:
                 # Compute exact norm
-                E_norm_sq = trace_AAt_BtB_squared - 2 * trace_AAt_BtB + n
+                E_norm_sq = 0.5 * (trace_AAt_BtB_squared + n) - trace_AAt_BtB
 
             # Compute sqrt(E_norm_sq) for logging
             norms.append(torch.sqrt(E_norm_sq).item())
