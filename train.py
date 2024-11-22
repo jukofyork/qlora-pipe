@@ -772,7 +772,7 @@ if __name__ == '__main__':
         def sqrt_ratio_fn(step):
             # Add 1 because LambdaLR starts counting from 0
             t = step + 1
-            return math.sqrt((1 - beta**t)/(1 + beta**t))
+            return torch.sqrt(torch.tensor((1 - decay**t)/(1 + decay**t))).item()
         
         lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
             optimizer,
