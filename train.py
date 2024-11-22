@@ -767,7 +767,7 @@ if __name__ == '__main__':
     if 'lr_scheduler' not in config or config['lr_scheduler'] == 'constant' or config['lr_scheduler'] == 'none':
         lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
     elif config['lr_scheduler'] == 'beta2_coupled_lr':
-        beta = config['optimizer'].get('beta2', 0.99)
+        beta = config['optimizer']['beta2']
         
         def make_rms_ratio_fn(beta):
             def rms_ratio_fn(step):
@@ -857,8 +857,8 @@ if __name__ == '__main__':
             avg_ortho_norm, max_ortho_norm, ortho_norms = apply_decoupled_orthogonality_regularization_approx(
                 pipeline_model,
                 config,
-                #optimizer.param_groups[0]['lr'],
-                #config['optimizer']['lr']
+                optimizer.param_groups[0]['lr'],
+                config['optimizer']['lr']
             )
 
         epoch = saver.process_epoch(epoch, step)
