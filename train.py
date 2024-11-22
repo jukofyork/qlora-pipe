@@ -766,6 +766,18 @@ if __name__ == '__main__':
 
     if 'lr_scheduler' not in config or config['lr_scheduler'] == 'constant' or config['lr_scheduler'] == 'none':
         lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
+    elif config['lr_scheduler'] == 'beta2_coupled_lr':
+        beta = config['optimizer'].get('beta2', 0.99)
+        
+        def sqrt_ratio_fn(step):
+            # Add 1 because LambdaLR starts counting from 0
+            t = step + 1
+            return math.sqrt((1 - beta**t)/(1 + beta**t))
+        
+        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=sqrt_ratio_fn
+        )
     elif config['lr_scheduler'] == 'cosine':
         total_steps = steps_per_epoch * config['epochs']
         total_steps -= warmup_steps
