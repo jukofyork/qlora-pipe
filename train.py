@@ -217,7 +217,7 @@ def apply_max_norm_regularization(model, config):
     return keys_scaled, avg_norm, max_norm, norms
 
 
-def apply_decoupled_orthogonality_regularization_approx(model, config, current_lr, max_lr):
+def apply_decoupled_orthogonality_regularization_approx(model, config, current_lr = 0, max_lr = 0):
     """
     Computes approximation of ½||CᵗC - I||_F², where C = I + BA:
     - Full expansion is ½||BA + AB + (BA)(AB)||_F²
@@ -250,6 +250,15 @@ def apply_decoupled_orthogonality_regularization_approx(model, config, current_l
     norms = []
     lora_scale = config['lora_alpha'] / config['lora_rank']
     orthogonality_lambda = config.get('orthogonality_lambda', 0)
+    
+    # Make it so that we can "completely decouple" so same is applied regardless.
+    # See: https://optimi.benjaminwarner.dev/fully_decoupled_weight_decay
+    if current_lr <= 0:
+        decoupled_lr = 1.0;                  # completely decoupled
+    elif max_lr <= 0:
+        decoupled_lr = current_lr;           # decoupled
+    else:
+        decoupled_lr = current_lr / max_lr;  # fully decoupled
 
     for name, param in model.named_parameters():
         if 'lora_A' in name:
@@ -279,10 +288,9 @@ def apply_decoupled_orthogonality_regularization_approx(model, config, current_l
                 E_norm_sq.backward()
 
                 # Update the weights in place, using the calculated gradients
-                # See: https://optimi.benjaminwarner.dev/fully_decoupled_weight_decay
                 with torch.no_grad():
-                    A -= (current_lr/max_lr) * orthogonality_lambda * A.grad
-                    B -= (current_lr/max_lr) * orthogonality_lambda * B.grad
+                    A -= decoupled_lr * orthogonality_lambda * A.grad
+                    B -= decoupled_lr * orthogonality_lambda * B.grad
 
                     # Clear gradients after manual update
                     A.grad = None
@@ -302,7 +310,7 @@ def apply_decoupled_orthogonality_regularization_approx(model, config, current_l
     return avg_norm, max_norm, norms
 
 
-def apply_decoupled_orthogonality_regularization_exact(model, config, current_lr, max_lr):
+def apply_decoupled_orthogonality_regularization_exact(model, config, current_lr = 0, max_lr = 0):
     """
     Computes the exact value of ½||CᵗC - I||_F² in an efficient manner, where C = I + BA.
 
@@ -362,6 +370,15 @@ def apply_decoupled_orthogonality_regularization_exact(model, config, current_lr
     lora_scale = config['lora_alpha'] / config['lora_rank']
     orthogonality_lambda = config.get('orthogonality_lambda', 0)
 
+    # Make it so that we can "completely decouple" so same is applied regardless.
+    # See: https://optimi.benjaminwarner.dev/fully_decoupled_weight_decay
+    if current_lr <= 0:
+        decoupled_lr = 1.0;                  # completely decoupled
+    elif max_lr <= 0:
+        decoupled_lr = current_lr;           # decoupled
+    else:
+        decoupled_lr = current_lr / max_lr;  # fully decoupled
+
     for name, param in model.named_parameters():
         if 'lora_A' in name:
             A = param
@@ -403,8 +420,8 @@ def apply_decoupled_orthogonality_regularization_exact(model, config, current_lr
                 # Update the weights in place, using the calculated gradients
                 # See: https://optimi.benjaminwarner.dev/fully_decoupled_weight_decay
                 with torch.no_grad():
-                    A -= (current_lr/max_lr) * orthogonality_lambda * A.grad
-                    B -= (current_lr/max_lr) * orthogonality_lambda * B.grad
+                    A -= decoupled_lr * orthogonality_lambda * A.grad
+                    B -= decoupled_lr * orthogonality_lambda * B.grad
 
                     # Clear gradients after manual update
                     A.grad = None
@@ -828,8 +845,8 @@ if __name__ == '__main__':
             avg_ortho_norm, max_ortho_norm, ortho_norms = apply_decoupled_orthogonality_regularization_approx(
                 pipeline_model,
                 config,
-                optimizer.param_groups[0]['lr'],
-                config['optimizer']['lr']
+                #optimizer.param_groups[0]['lr'],
+                #config['optimizer']['lr']
             )
 
         epoch = saver.process_epoch(epoch, step)
