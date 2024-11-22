@@ -771,8 +771,7 @@ if __name__ == '__main__':
         
         def make_rms_ratio_fn(beta):
             def rms_ratio_fn(step):
-                t = step + 1
-                return torch.sqrt(torch.tensor((1 - beta**t)/(1 + beta**t))).item()
+                return torch.sqrt(torch.tensor((1 - beta**step)/(1 + beta**step))).item()
             return rms_ratio_fn
         
         lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
