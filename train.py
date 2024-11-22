@@ -769,14 +769,15 @@ if __name__ == '__main__':
     elif config['lr_scheduler'] == 'beta2_coupled_lr':
         beta = config['optimizer'].get('beta2', 0.99)
         
-        def sqrt_ratio_fn(step):
-            # Add 1 because LambdaLR starts counting from 0
-            t = step + 1
-            return torch.sqrt(torch.tensor((1 - decay**t)/(1 + decay**t))).item()
+        def make_rms_ratio_fn(beta):
+            def rms_ratio_fn(step):
+                t = step + 1
+                return torch.sqrt(torch.tensor((1 - beta**t)/(1 + beta**t))).item()
+            return rms_ratio_fn
         
         lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
             optimizer,
-            lr_lambda=sqrt_ratio_fn
+            lr_lambda=make_rms_ratio_fn(beta)
         )
     elif config['lr_scheduler'] == 'cosine':
         total_steps = steps_per_epoch * config['epochs']
