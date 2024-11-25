@@ -766,19 +766,6 @@ if __name__ == '__main__':
 
     if 'lr_scheduler' not in config or config['lr_scheduler'] == 'constant' or config['lr_scheduler'] == 'none':
         lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
-    elif config['lr_scheduler'] == 'beta2_coupled_lr':
-        beta = config['optimizer']['beta2']
-        
-        def make_rms_ratio_fn(beta):
-            def rms_ratio_fn(step):
-                return torch.sqrt(torch.tensor((1 - beta**step)/(1 + beta**step))).item()
-                #return 1 - beta**step
-            return rms_ratio_fn
-        
-        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer,
-            lr_lambda=make_rms_ratio_fn(beta)
-        )
     elif config['lr_scheduler'] == 'cosine':
         total_steps = steps_per_epoch * config['epochs']
         total_steps -= warmup_steps
@@ -791,7 +778,15 @@ if __name__ == '__main__':
     load_optimizer_states = config.get('load_optimizer_states', True)
     # if resuming and not loading optimizer states, we can't use warmup or the LR never changes from the initial value (still don't know why)
     if warmup_steps > 0 and load_optimizer_states:
-        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1/warmup_steps, total_iters=warmup_steps)
+        if 'use_rms_coupled_warmup' in config:
+            beta = config['optimizer']['beta2']
+            def make_rms_ratio_fn(beta):
+                def rms_ratio_fn(step):
+                    return torch.sqrt(torch.tensor((1 - beta**step)/(1 + beta**step))).item()
+                return rms_ratio_fn
+            warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=make_rms_ratio_fn(beta))
+        else:
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1/warmup_steps, total_iters=warmup_steps)
         lr_scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, lr_scheduler], milestones=[warmup_steps])
 
     model_engine.lr_scheduler = lr_scheduler
