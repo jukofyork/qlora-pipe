@@ -854,7 +854,7 @@ if __name__ == '__main__':
                 pipeline_model,
                 config,
                 optimizer.param_groups[0]['lr'],
-                config['optimizer']['lr']
+                #config['optimizer']['lr']
             )
 
         epoch = saver.process_epoch(epoch, step)
