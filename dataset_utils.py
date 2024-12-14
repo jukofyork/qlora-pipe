@@ -67,7 +67,15 @@ def load_raw_dataset(dataset_path, tokenizer, sequence_len, eval_size, overlap=0
     # TODO: maybe do it this way instead
     #dataset = dataset.map(lambda x: {'tokens': slice_into_chunks(x['tokens'][0], sequence_len, overlap=overlap)}, batched=True, batch_size=1)
     dataset = dataset.map(lambda x: {'input_ids': list(yield_sequences_from_token_batch(tokenizer, x['input_ids'], sequence_len))}, batched=True, batch_size=None, remove_columns=dataset.column_names, desc='splitting')
-    dataset = dataset.map(lambda x: {'attention_mask': torch.ones_like(x['input_ids']), 'labels': x['input_ids']}, desc='adding attention_mask and labels')
+    #dataset = dataset.map(lambda x: {'attention_mask': torch.ones_like(x['input_ids']), 'labels': x['input_ids']}, desc='adding attention_mask and labels')
+    # Set labels with `eos_token_id` to -100 to avoid learning them
+    dataset = dataset.map(
+        lambda x: {
+            'attention_mask': torch.ones_like(x['input_ids']),
+            'labels': torch.where(x['input_ids'] == tokenizer.eos_token_id, torch.full_like(x['input_ids'], -100), x['input_ids'])
+        },
+        desc='adding attention_mask and labels'
+    )
     if eval_size > 0:
         split_datasets = dataset.train_test_split(test_size=eval_size, shuffle=True, seed=42)
         train_data = split_datasets['train']
