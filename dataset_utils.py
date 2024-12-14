@@ -62,7 +62,7 @@ def load_raw_dataset(dataset_path, tokenizer, sequence_len, eval_size, overlap=0
     num_proc = min(64, os.cpu_count())
     if subsample_documents:
         dataset = dataset.shuffle(seed=13).select(list(range(int(subsample_documents*len(dataset)))))
-    else
+    else:
         dataset = dataset.shuffle(seed=13)  # Always shuffle otherwise the small files will be next to each other in the batch
 
     dataset = dataset.map(lambda x: tokenizer(x['text']), batched=True, batch_size=10, remove_columns=dataset.column_names, desc='tokenizing', num_proc=num_proc)
