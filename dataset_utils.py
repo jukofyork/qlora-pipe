@@ -19,8 +19,8 @@ def yield_sequences_from_token_batch(tokenizer, token_batch, sequence_len):
     example_tokens = []
     for tokens in tqdm(token_batch):
         tokens = tokens.tolist()
-        assert tokens[-1] != tokenizer.eos_token_id, tokens[-1]
-        tokens.append(tokenizer.eos_token_id)
+        ###assert tokens[-1] != tokenizer.eos_token_id, tokens[-1]
+        ###tokens.append(tokenizer.eos_token_id)
         while len(tokens) > 0:
             taken = tokens[:need]
             tokens = tokens[need:]
@@ -62,21 +62,19 @@ def load_raw_dataset(dataset_path, tokenizer, sequence_len, eval_size, overlap=0
     num_proc = min(64, os.cpu_count())
     if subsample_documents:
         dataset = dataset.shuffle(seed=13).select(list(range(int(subsample_documents*len(dataset)))))
-    else:
-        dataset = dataset.shuffle(seed=13)  # Always shuffle otherwise the small files will be next to each other in the batch
 
     dataset = dataset.map(lambda x: tokenizer(x['text']), batched=True, batch_size=10, remove_columns=dataset.column_names, desc='tokenizing', num_proc=num_proc)
     # TODO: maybe do it this way instead
     #dataset = dataset.map(lambda x: {'tokens': slice_into_chunks(x['tokens'][0], sequence_len, overlap=overlap)}, batched=True, batch_size=1)
     dataset = dataset.map(lambda x: {'input_ids': list(yield_sequences_from_token_batch(tokenizer, x['input_ids'], sequence_len))}, batched=True, batch_size=None, remove_columns=dataset.column_names, desc='splitting')
-    #dataset = dataset.map(lambda x: {'attention_mask': torch.ones_like(x['input_ids']), 'labels': x['input_ids']}, desc='adding attention_mask and labels')
+    ###dataset = dataset.map(lambda x: {'attention_mask': torch.ones_like(x['input_ids']), 'labels': x['input_ids']}, desc='adding attention_mask and labels')
     # Set labels with `eos_token_id` to -100 to avoid learning them
     dataset = dataset.map(
         lambda x: {
             'attention_mask': torch.ones_like(x['input_ids']),
             'labels': torch.where(x['input_ids'] == tokenizer.eos_token_id, torch.full_like(x['input_ids'], -100), x['input_ids'])
         },
-        desc='adding attention_mask and labels'
+        desc='adding attention_mask and labels (with EOS = -100)'
     )
     if eval_size > 0:
         split_datasets = dataset.train_test_split(test_size=eval_size, shuffle=True, seed=42)
