@@ -25,37 +25,33 @@ def yield_sequences_from_token_batch(tokenizer, token_batch, sequence_len):
     for tokens in tqdm(token_batch):
         tokens = tokens.tolist()
         idx = 0
-        tokens_length = len(tokens)
-        while idx < tokens_length:
-            example_tokens = []
-            need = sequence_len
+        while idx < len(tokens):
+            sequence_tokens = []
 
             # Prepend BOS token if required and not already present
             if tokenizer.bos_token_id is not None and tokens[idx] != tokenizer.bos_token_id:
-                example_tokens.append(tokenizer.bos_token_id)
-                need -= 1
+                sequence_tokens.append(tokenizer.bos_token_id)
 
-            while need > 0 and idx < tokens_length:
+            while len(sequence_tokens) < sequence_len and idx < tokens_length:
                 # Find next complete chunk (up to and including next EOS token)
                 # NOTE: Raises ValueError if EOS token cannot be found in remaining tokens
                 eos_idx = tokens.index(tokenizer.eos_token_id, idx)
-                temp_chunk = tokens[idx:eos_idx + 1]
-                assert len(temp_chunk) <= sequence_len, "temp_chunk exceeds sequence length"
+                chunk = tokens[idx:eos_idx + 1]
                    
                 # If chunk won't fit in remaining space, pad and then yield current sequence
-                if len(temp_chunk) > need:
+                if len(sequence_tokens) + len(chunk) > sequence_len:
+                    assert len(chunk) <= sequence_len, "chunk exceeds sequence length"
                     break
                 
                  # Add chunk to sequence and update counters
-                example_tokens.extend(temp_chunk)
-                need -= len(temp_chunk)
-                idx += len(temp_chunk)
+                sequence_tokens.extend(chunk)
+                idx += len(chunk)
             
             # Pad incomplete sequences with EOS tokens
-            if need > 0:
-                example_tokens.extend([tokenizer.eos_token_id] * need)
+            if len(sequence_tokens) < sequence_len:
+                sequence_tokens.extend([tokenizer.eos_token_id] * (sequence_len - len(sequence_tokens)))
             
-            yield example_tokens
+            yield sequence_tokens
 
 
 def slice_into_chunks(x, sequence_len, overlap=0):
