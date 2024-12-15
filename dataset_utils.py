@@ -15,36 +15,47 @@ from utils import *
 
 
 def yield_sequences_from_token_batch(tokenizer, token_batch, sequence_len):
-    need = sequence_len
-    example_tokens = []
+    """Yields fixed-length sequences from batches of tokens, ensuring proper BOS/EOS token handling.
+    
+    Takes batches of tokens and yields sequences of fixed length, with each sequence:
+    - Starting with BOS token if specified in tokeniser
+    - Containing complete chunks terminated by EOS tokens (never splitting between EOS tokens)
+    - Padded (to the right) with extra EOS tokens if needed so all reach exactly sequence_len
+    """
     for tokens in tqdm(token_batch):
         tokens = tokens.tolist()
-        while len(tokens) > 0:
-            taken = tokens[:need]
-            tokens = tokens[need:]
-            need -= len(taken)
-            example_tokens.extend(taken)
-            if len(example_tokens) >= sequence_len:
-                assert len(example_tokens) == sequence_len
-                # Force each sequence to start with BOS.
-                if tokenizer.bos_token_id is not None and example_tokens[0] != tokenizer.bos_token_id:
-                    tokens = [example_tokens[-1]] + tokens
-                    example_tokens = [tokenizer.bos_token_id] + example_tokens[:-1]
-                # Work backwards through example_tokens until EOS is hit
-                for i in reversed(range(len(example_tokens))):
-                    if example_tokens[i] == tokenizer.eos_token_id:
-                        break
-                    tokens = [example_tokens[i]] + tokens
-                    example_tokens[i] = tokenizer.eos_token_id
-                yield example_tokens
-                need = sequence_len
-                example_tokens = []
-    # yield anything remaining, right-padded with EOS tokens
-    if len(example_tokens) > 0:
-        # Append EOS tokens to `example_tokens` to make the length up to `sequence_len`
-        padding_tokens = sequence_len - len(example_tokens)
-        example_tokens.extend([tokenizer.eos_token_id] * padding_tokens)
-        yield example_tokens
+        idx = 0
+        tokens_length = len(tokens)
+        while idx < tokens_length:
+            example_tokens = []
+            need = sequence_len
+
+            # Prepend BOS token if required and not already present
+            if tokenizer.bos_token_id is not None and tokens[idx] != tokenizer.bos_token_id:
+                example_tokens.append(tokenizer.bos_token_id)
+                need -= 1
+
+            while need > 0 and idx < tokens_length:
+                # Find next complete chunk (up to and including next EOS token)
+                # NOTE: Raises ValueError if EOS token cannot be found in remaining tokens
+                eos_idx = tokens.index(tokenizer.eos_token_id, idx)
+                temp_chunk = tokens[idx:eos_idx + 1]
+                assert len(temp_chunk) <= sequence_len, "temp_chunk exceeds sequence length"
+                   
+                # If chunk won't fit in remaining space, pad and then yield current sequence
+                if len(temp_chunk) > need:
+                    break
+                
+                 # Add chunk to sequence and update counters
+                example_tokens.extend(temp_chunk)
+                need -= len(temp_chunk)
+                idx += len(temp_chunk)
+            
+            # Pad incomplete sequences with EOS tokens
+            if need > 0:
+                example_tokens.extend([tokenizer.eos_token_id] * need)
+            
+            yield example_tokens
 
 
 def slice_into_chunks(x, sequence_len, overlap=0):
@@ -69,17 +80,14 @@ def load_raw_dataset(dataset_path, tokenizer, sequence_len, eval_size, overlap=0
         dataset = dataset.shuffle(seed=13).select(list(range(int(subsample_documents*len(dataset)))))
 
     dataset = dataset.map(lambda x: tokenizer(x['text']), batched=True, batch_size=10, remove_columns=dataset.column_names, desc='tokenizing', num_proc=num_proc)
-    # TODO: maybe do it this way instead
-    #dataset = dataset.map(lambda x: {'tokens': slice_into_chunks(x['tokens'][0], sequence_len, overlap=overlap)}, batched=True, batch_size=1)
     dataset = dataset.map(lambda x: {'input_ids': list(yield_sequences_from_token_batch(tokenizer, x['input_ids'], sequence_len))}, batched=True, batch_size=None, remove_columns=dataset.column_names, desc='splitting')
-    ###dataset = dataset.map(lambda x: {'attention_mask': torch.ones_like(x['input_ids']), 'labels': x['input_ids']}, desc='adding attention_mask and labels')
-    # Set labels with `eos_token_id` to -100 to avoid learning them
+    # Set labels for EOS tokens -100 to exclude them from training gradient calculations
     dataset = dataset.map(
         lambda x: {
             'attention_mask': torch.ones_like(x['input_ids']),
             'labels': torch.where(x['input_ids'] == tokenizer.eos_token_id, torch.full_like(x['input_ids'], -100), x['input_ids'])
         },
-        desc='adding attention_mask and labels (with EOS = -100)'
+        desc='adding attention_mask and labels (with EOS labels set to -100)'
     )
     if eval_size > 0:
         split_datasets = dataset.train_test_split(test_size=eval_size, shuffle=True, seed=42)
