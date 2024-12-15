@@ -19,8 +19,6 @@ def yield_sequences_from_token_batch(tokenizer, token_batch, sequence_len):
     example_tokens = []
     for tokens in tqdm(token_batch):
         tokens = tokens.tolist()
-        ###assert tokens[-1] != tokenizer.eos_token_id, tokens[-1]
-        ###tokens.append(tokenizer.eos_token_id)
         while len(tokens) > 0:
             taken = tokens[:need]
             tokens = tokens[need:]
@@ -29,17 +27,24 @@ def yield_sequences_from_token_batch(tokenizer, token_batch, sequence_len):
             if len(example_tokens) >= sequence_len:
                 assert len(example_tokens) == sequence_len
                 # Force each sequence to start with BOS.
-                # TODO: can we do this better? It's possible that the first token is EOS followed by BOS.
                 if tokenizer.bos_token_id is not None and example_tokens[0] != tokenizer.bos_token_id:
                     tokens = [example_tokens[-1]] + tokens
                     example_tokens = [tokenizer.bos_token_id] + example_tokens[:-1]
+                # Work backwards through example_tokens until EOS is hit
+                for i in reversed(range(len(example_tokens))):
+                    if example_tokens[i] == tokenizer.eos_token_id:
+                        break
+                    tokens = [example_tokens[i]] + tokens
+                    example_tokens[i] = tokenizer.eos_token_id
                 yield example_tokens
                 need = sequence_len
                 example_tokens = []
-    # yield anything remaining
-    # TODO: disabled until I get training working with variable length sequences
-    # if len(example_tokens) > 0:
-    #     yield example_tokens
+    # yield anything remaining, right-padded with EOS tokens
+    if len(example_tokens) > 0:
+        # Append EOS tokens to `example_tokens` to make the length up to `sequence_len`
+        padding_tokens = sequence_len - len(example_tokens)
+        example_tokens.extend([tokenizer.eos_token_id] * padding_tokens)
+        yield example_tokens
 
 
 def slice_into_chunks(x, sequence_len, overlap=0):
