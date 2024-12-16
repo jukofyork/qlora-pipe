@@ -46,7 +46,8 @@ def yield_sequences_from_token_batch(tokenizer, token_batch, sequence_len):
             sequence_tokens.extend(chunk)
             idx += len(chunk)
 
-    if len(sequence_tokens) > 0:
+    # Yield the final sequence if it is at least 50% populated
+    if len(sequence_tokens) >= sequence_len / 2:
         sequence_tokens.extend([tokenizer.eos_token_id] * (sequence_len - len(sequence_tokens)))
         yield sequence_tokens
 
