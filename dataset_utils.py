@@ -20,39 +20,35 @@ def yield_sequences_from_token_batch(tokenizer, token_batch, sequence_len):
     Takes batches of tokens and yields sequences of fixed length, with each sequence:
     - Starting with BOS token if specified in tokeniser
     - Containing complete chunks terminated by EOS tokens (never splitting between EOS tokens)
-    - Padded (to the right) with extra EOS tokens if needed so all reach exactly sequence_len
+    - Right-padded with extra EOS tokens if needed so all reach exactly sequence_len
     """
+    sequence_tokens = [] if tokenizer.bos_token_id is None else [tokenizer.bos_token_id]
     for tokens in tqdm(token_batch):
         tokens = tokens.tolist()
+        assert len(tokens) > 0, "empty token list"
+        assert tokens[-1] == tokenizer.eos_token_id, "token lists must end with EOS"
+
         idx = 0
-        while idx < len(tokens):
-            sequence_tokens = []
+        # If present, skip the auto-generated BOS token
+        if tokenizer.bos_token_id is not None and tokens[0] == tokenizer.bos_token_id:
+            idx += 1
 
-            # Prepend BOS token if required and not already present
-            if tokenizer.bos_token_id is not None and tokens[idx] != tokenizer.bos_token_id:
-                sequence_tokens.append(tokenizer.bos_token_id)
-
-            while len(sequence_tokens) < sequence_len and idx < tokens_length:
-                # Find next complete chunk (up to and including next EOS token)
-                # NOTE: Raises ValueError if EOS token cannot be found in remaining tokens
-                eos_idx = tokens.index(tokenizer.eos_token_id, idx)
-                chunk = tokens[idx:eos_idx + 1]
-                   
-                # If chunk won't fit in remaining space, pad and then yield current sequence
-                if len(sequence_tokens) + len(chunk) > sequence_len:
-                    assert len(chunk) <= sequence_len, "chunk exceeds sequence length"
-                    break
-                
-                 # Add chunk to sequence and update counters
-                sequence_tokens.extend(chunk)
-                idx += len(chunk)
-            
-            # Pad incomplete sequences with EOS tokens
-            if len(sequence_tokens) < sequence_len:
+        while idx < len(tokens):          
+            next_eos_idx = tokens.index(tokenizer.eos_token_id, idx)
+            chunk = tokens[idx:next_eos_idx + 1]
+            assert len(chunk) <= sequence_len, "chunk exceeds sequence length"
+ 
+            if len(sequence_tokens) + len(chunk) > sequence_len:
                 sequence_tokens.extend([tokenizer.eos_token_id] * (sequence_len - len(sequence_tokens)))
-            
-            yield sequence_tokens
+                yield sequence_tokens
+                sequence_tokens = [] if tokenizer.bos_token_id is None else [tokenizer.bos_token_id]
 
+            sequence_tokens.extend(chunk)
+            idx += len(chunk)
+
+    if len(sequence_tokens) > 0:
+        sequence_tokens.extend([tokenizer.eos_token_id] * (sequence_len - len(sequence_tokens)))
+        yield sequence_tokens
 
 def slice_into_chunks(x, sequence_len, overlap=0):
     result = []
