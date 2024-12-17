@@ -216,16 +216,6 @@ def _cross_entropy_backward(
         y - 1.0, # exp(x - logsumexp) - 1
         y,       # exp(x - logsumexp)
     )
-    
-    # Zero out the gradient for all the "special" Cohere tokeniser tokens
-    # NOTE: This should freeze the probability of generating these regardless of our fine-tuning dataset
-    # SEE: https://huggingface.co/CohereForAI/c4ai-command-r-v01/blob/main/tokenizer.json 
-    # SEE: https://huggingface.co/spaces/Xenova/the-tokenizer-playground
-    y = tl.where(
-        (col_offsets <= 7) | (col_offsets >= 255000),
-        0.0,  # Set gradient to zero for special tokens
-        y     # Keep existing gradient calculation otherwise
-    )
 
     # If y == 0: dC/dx = 0 ==> we already masked it to be = 0, so dloss = 0.
     if DO_LOGIT_SCALING:
@@ -233,6 +223,10 @@ def _cross_entropy_backward(
         y = LOGIT_SCALE * y
     pass
     tl.store(logits_ptr + col_offsets, dloss * y, mask = mask)
+    
+    # Zero out gradients for special token ranges
+    zero_mask = ((col_offsets <= 7) | (col_offsets >= 255000)) & (col_offsets < VOCAB_SIZE)
+    tl.store(logits_ptr + col_offsets, 0.0, mask = zero_mask)   
 pass
 
 
