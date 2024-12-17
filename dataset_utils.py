@@ -19,7 +19,7 @@ def yield_sequences_from_token_batch(tokenizer, token_batch, sequence_len):
     
     Takes batches of tokens and yields sequences of fixed length, with each sequence:
     - Starting with BOS token if specified in tokeniser
-    - Containing complete chunks terminated by EOS tokens (never splitting between EOS tokens)
+    - Containing complete chunks terminated by double newlines (never splitting between EOS tokens)
     - Right-padded with extra EOS tokens if needed so all reach exactly sequence_len
     """
     sequence_tokens = [] if tokenizer.bos_token_id is None else [tokenizer.bos_token_id]
@@ -35,7 +35,7 @@ def yield_sequences_from_token_batch(tokenizer, token_batch, sequence_len):
 
         while idx < len(tokens):          
             next_eos_idx = tokens.index(tokenizer.eos_token_id, idx)
-            chunk = tokens[idx:next_eos_idx + 1]
+            chunk = tokens[idx:next_eos_idx]  # Up to, but *NOT* including the EOS token
             assert len(chunk) <= sequence_len, "chunk exceeds sequence length"
  
             if len(sequence_tokens) + len(chunk) > sequence_len:
@@ -44,12 +44,13 @@ def yield_sequences_from_token_batch(tokenizer, token_batch, sequence_len):
                 sequence_tokens = [] if tokenizer.bos_token_id is None else [tokenizer.bos_token_id]
 
             sequence_tokens.extend(chunk)
-            idx += len(chunk)
+            idx += len(chunk) + 1  # Skip over the EOS token.
 
-    # Yield the final sequence if it is at least 50% populated
-    if len(sequence_tokens) >= sequence_len / 2:
-        sequence_tokens.extend([tokenizer.eos_token_id] * (sequence_len - len(sequence_tokens)))
-        yield sequence_tokens
+    # Yield the final sequence with EOS padding, if it is at least 50% populated
+    # NOTE: The loss for each sequence doesn't use the weighted mean, so this might bad a bad idea...
+    ##if len(sequence_tokens) >= sequence_len / 2:
+    ##    sequence_tokens.extend([tokenizer.eos_token_id] * (sequence_len - len(sequence_tokens)))
+    ##    yield sequence_tokens
 
 def slice_into_chunks(x, sequence_len, overlap=0):
     result = []
@@ -74,10 +75,10 @@ def load_raw_dataset(dataset_path, tokenizer, sequence_len, eval_size, overlap=0
 
     dataset = dataset.map(lambda x: tokenizer(x['text']), batched=True, batch_size=10, remove_columns=dataset.column_names, desc='tokenizing', num_proc=num_proc)
     dataset = dataset.map(lambda x: {'input_ids': list(yield_sequences_from_token_batch(tokenizer, x['input_ids'], sequence_len))}, batched=True, batch_size=None, remove_columns=dataset.column_names, desc='splitting')
-    # Set labels for EOS tokens -100 to exclude them from training gradient calculations
+    # Mask the EOS tokens -100 to exclude them from attention and gradient calculations
     dataset = dataset.map(
         lambda x: {
-            'attention_mask': torch.ones_like(x['input_ids']),
+            'attention_mask': torch.where(x['input_ids'] == tokenizer.eos_token_id, torch.zeros_like(x['input_ids']), torch.ones_like(x['input_ids'])),
             'labels': torch.where(x['input_ids'] == tokenizer.eos_token_id, torch.full_like(x['input_ids'], -100), x['input_ids'])
         },
         desc='adding attention_mask and labels (with EOS labels set to -100)'
