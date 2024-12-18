@@ -42,30 +42,6 @@ def set_data(module, data):
         module.weight.data = data
 
 
-def zero_out_special_tokens(logits, labels, chunk_size=128):
-    """
-    Zero out the logits for special tokens and set corresponding labels to -100.
-    Processes logits in small chunks (in-place) to reduce VRAM usage.
-    
-    Args:
-    logits (torch.Tensor): shape (batch_size, vocab_size)
-    labels (torch.Tensor): shape (batch_size,)
-    chunk_size (int): Number of rows of logits to process per chunk
-    """
-    SPECIAL_TOKEN_LOW_THRESHOLD = 7
-    SPECIAL_TOKEN_HIGH_THRESHOLD = 255000
-    
-    #  Set logits for special tokens to -inf in smaller chunks
-    for start_idx in range(0, logits.size(0), chunk_size):
-        end_idx = min(start_idx + chunk_size, logits.size(0))
-        logits[start_idx:end_idx, :SPECIAL_TOKEN_LOW_THRESHOLD + 1] = float('-inf')
-        logits[start_idx:end_idx, SPECIAL_TOKEN_HIGH_THRESHOLD:] = float('-inf')
-    
-    # Set labels corresponding to special tokens to -100 in one pass
-    special_mask = (labels <= SPECIAL_TOKEN_LOW_THRESHOLD) | (labels >= SPECIAL_TOKEN_HIGH_THRESHOLD)
-    labels[special_mask] = -100
-
-
 def entropy_fn(logits):
     result = []
     # There is a very wide range of chuck sizes that cause no increase in memory reported by
@@ -125,10 +101,6 @@ class ComputeMetrics(nn.Module):
         vocab_size = shift_logits.size(-1)
         shift_logits = shift_logits.view(-1, vocab_size)
         shift_labels = shift_labels.view(-1)
-        
-        # Zero out special tokens (in-place)
-        with torch.no_grad():
-            zero_out_special_tokens(shift_logits, shift_labels)
     
         # Enable model parallelism
         shift_labels = shift_labels.to(shift_logits.device)
