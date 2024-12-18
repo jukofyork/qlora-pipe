@@ -103,8 +103,8 @@ class ComputeMetrics(nn.Module):
         shift_labels = shift_labels.view(-1)
         # Enable model parallelism
         shift_labels = shift_labels.to(shift_logits.device)
-
         valid_loss = (shift_labels >= 0)
+
         cross_entropy_loss_unreduced = Fast_CrossEntropyLoss.apply(shift_logits, shift_labels)
         cross_entropy_loss_unreduced = cross_entropy_loss_unreduced[valid_loss]
 
