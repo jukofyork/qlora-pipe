@@ -42,6 +42,27 @@ def set_data(module, data):
         module.weight.data = data
 
 
+def zero_out_special_tokens(logits, labels):
+    """
+    Zero out the logits for special tokens and set corresponding labels to -100.
+    This function modifies the input tensors in-place.
+    
+    Args:
+    logits (torch.Tensor): Tensor of shape (-1, vocab_size)
+    labels (torch.Tensor): Tensor of shape (-1,)
+    """
+    # Constants for special token ranges
+    SPECIAL_TOKEN_LOW_THRESHOLD = 7
+    SPECIAL_TOKEN_HIGH_THRESHOLD = 255000
+
+    # Set logits for special tokens to -inf for all rows
+    logits[:, :SPECIAL_TOKEN_LOW_THRESHOLD + 1] = float('-inf')  # Tokens 0 to 7
+    logits[:, SPECIAL_TOKEN_HIGH_THRESHOLD:] = float('-inf')  # Tokens 255000 and above
+    
+    # Set labels corresponding to special tokens to -100
+    labels[(labels <= SPECIAL_TOKEN_LOW_THRESHOLD) | (labels >= SPECIAL_TOKEN_HIGH_THRESHOLD)] = -100
+
+
 def entropy_fn(logits):
     result = []
     # There is a very wide range of chuck sizes that cause no increase in memory reported by
@@ -101,6 +122,10 @@ class ComputeMetrics(nn.Module):
         vocab_size = shift_logits.size(-1)
         shift_logits = shift_logits.view(-1, vocab_size)
         shift_labels = shift_labels.view(-1)
+        
+        # Zero out special tokens (in-place)
+        zero_out_special_tokens(shift_logits, shift_labels)
+    
         # Enable model parallelism
         shift_labels = shift_labels.to(shift_logits.device)
         valid_loss = (shift_labels >= 0)

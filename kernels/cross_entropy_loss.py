@@ -217,15 +217,6 @@ def _cross_entropy_backward(
         y,       # exp(x - logsumexp)
     )
 
-    #######################################################
-    # Zero out the gradients for the Cohere special tokens.
-    y = tl.where(
-        (col_offsets <= 7) | (col_offsets >= 255000),
-        0.0,
-        y,
-    )
-    #######################################################
-
     # If y == 0: dC/dx = 0 ==> we already masked it to be = 0, so dloss = 0.
     if DO_LOGIT_SCALING:
         # d/dx [s * x] = s
