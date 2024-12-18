@@ -196,7 +196,12 @@ def _cross_entropy_backward(
     logits_ptr += row_idx * logits_row_stride.to(tl.int64)
     dloss_ptr  += row_idx *  dloss_row_stride
     col_offsets = block_idx*BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = col_offsets < VOCAB_SIZE
+    ##########################################################################################
+    # mask = col_offsets < VOCAB_SIZE
+    ##########################################################################################
+    # Update the mask to exclude special tokens
+    mask = (col_offsets < VOCAB_SIZE) & (col_offsets > 7) & (col_offsets < 255000)
+    ##########################################################################################
     label_idx = tl.load(labels_ptr + row_idx).to(tl.int32)
 
     if label_idx != -100:
@@ -204,7 +209,15 @@ def _cross_entropy_backward(
     else:
         dloss = 0.0
 
-    x = tl.load(logits_ptr + col_offsets, mask = mask, other = -float("inf")).to(tl.float32)
+    ##########################################################################################
+    # x = tl.load(logits_ptr + col_offsets, mask = mask, other = -float("inf")).to(tl.float32)
+    ##########################################################################################
+    x = tl.load(
+        logits_ptr + col_offsets,
+        mask=mask,
+        other=0.0,  # Use 0.0 since these positions are masked out
+    ).to(tl.float32)
+    ##########################################################################################
     if DO_LOGIT_SCALING:
         # d/dx [s * x] = s
         x = LOGIT_SCALE * x
@@ -223,10 +236,6 @@ def _cross_entropy_backward(
         y = LOGIT_SCALE * y
     pass
     tl.store(logits_ptr + col_offsets, dloss * y, mask = mask)
-    
-    # Zero out gradients for special token ranges
-    zero_mask = ((col_offsets <= 7) | (col_offsets >= 255000)) & (col_offsets < VOCAB_SIZE)
-    tl.store(logits_ptr + col_offsets, 0.0, mask = zero_mask)   
 pass
 
 
