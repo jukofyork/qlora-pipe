@@ -127,7 +127,8 @@ class ComputeMetrics(nn.Module):
         shift_labels = shift_labels.view(-1)
         
         # Zero out special tokens (in-place)
-        zero_out_special_tokens(shift_logits, shift_labels)
+        with torch.no_grad():
+            zero_out_special_tokens(shift_logits, shift_labels)
     
         # Enable model parallelism
         shift_labels = shift_labels.to(shift_logits.device)
