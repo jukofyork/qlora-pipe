@@ -42,25 +42,28 @@ def set_data(module, data):
         module.weight.data = data
 
 
-def zero_out_special_tokens(logits, labels):
+def zero_out_special_tokens(logits, labels, chunk_size=128):
     """
     Zero out the logits for special tokens and set corresponding labels to -100.
-    This function modifies the input tensors in-place.
+    Processes logits in small chunks (in-place) to reduce VRAM usage.
     
     Args:
-    logits (torch.Tensor): Tensor of shape (-1, vocab_size)
-    labels (torch.Tensor): Tensor of shape (-1,)
+    logits (torch.Tensor): shape (batch_size, vocab_size)
+    labels (torch.Tensor): shape (batch_size,)
+    chunk_size (int): Number of rows of logits to process per chunk
     """
-    # Constants for special token ranges
     SPECIAL_TOKEN_LOW_THRESHOLD = 7
     SPECIAL_TOKEN_HIGH_THRESHOLD = 255000
-
-    # Set logits for special tokens to -inf for all rows
-    logits[:, :SPECIAL_TOKEN_LOW_THRESHOLD + 1] = float('-inf')  # Tokens 0 to 7
-    logits[:, SPECIAL_TOKEN_HIGH_THRESHOLD:] = float('-inf')  # Tokens 255000 and above
     
-    # Set labels corresponding to special tokens to -100
-    labels[(labels <= SPECIAL_TOKEN_LOW_THRESHOLD) | (labels >= SPECIAL_TOKEN_HIGH_THRESHOLD)] = -100
+    #  Set logits for special tokens to -inf in smaller chunks
+    for start_idx in range(0, logits.size(0), chunk_size):
+        end_idx = min(start_idx + chunk_size, logits.size(0))
+        logits[start_idx:end_idx, :SPECIAL_TOKEN_LOW_THRESHOLD + 1] = float('-inf')
+        logits[start_idx:end_idx, SPECIAL_TOKEN_HIGH_THRESHOLD:] = float('-inf')
+    
+    # Set labels corresponding to special tokens to -100 in one pass
+    special_mask = (labels <= SPECIAL_TOKEN_LOW_THRESHOLD) | (labels >= SPECIAL_TOKEN_HIGH_THRESHOLD)
+    labels[special_mask] = -100
 
 
 def entropy_fn(logits):
