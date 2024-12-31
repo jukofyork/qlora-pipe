@@ -251,7 +251,7 @@ class CustomPipelineEngine(PipelineEngine):
 
         # Do final sanity check
         if torch.any(torch.isnan(all_norms)):
-            raise RuntimeError(f'NaN detected in norms, probably some/all weights are NaN')
+            raise RuntimeError('NaN detected in norms, probably some/all weights are NaN')
 
         return all_norms
 

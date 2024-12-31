@@ -183,6 +183,7 @@ def apply_lora_max_norm_regularization(model, config):
                     W = lora_scale * (b_param @ param)
                     norm = W.norm().clamp(min=max_norm / 2)
                     desired = torch.clamp(norm, max=max_norm)
+                    assert not torch.isnan(norm), f"'NaN detected for composite matrix: {b_name} @ {name}"
                     assert norm > 0, f"Zero-valued norm for composite matrix: {b_name} @ {name}"
                     ratio = desired.cpu() / norm.cpu()
                     if ratio != 1:
