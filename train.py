@@ -167,53 +167,31 @@ def evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accu
         tb_writer.add_scalar('eval/eval_time_sec', duration, step)
     return sum(loss) / len(loss) if len(loss) > 0 else None
 
-"""
-def apply_max_norm_regularization(model, config):
+
+def apply_lora_max_norm_regularization(model, config):
     # modifed from https://github.com/kohya-ss/sd-scripts/blob/main/networks/lora.py
-    A_keys = []
-    B_keys = []
-    norms = []
-    keys_scaled = 0
-    lora_scale = config['lora_alpha'] / config['lora_rank']
+    num_scaled = 0
+    if 'scale_weight_norms' in config:
+        max_norm = config['scale_weight_norms']
+        assert max_norm > 0, "Max norm must be positive"
+        lora_scale = config['lora_alpha'] / config['lora_rank']
+        for name, param in model.named_parameters():
+            if 'lora_A' in name:
+                b_name = name.replace('lora_A', 'lora_B')
+                b_param = next(p for n, p in model.named_parameters() if n == b_name)
+                with torch.no_grad():
+                    W = lora_scale * (b_param @ param)
+                    norm = W.norm().clamp(min=max_norm / 2)
+                    desired = torch.clamp(norm, max=max_norm)
+                    assert norm > 0, f"Zero-valued norm for composite matrix: {b_name} @ {name}"
+                    ratio = desired.cpu() / norm.cpu()
+                    if ratio != 1:
+                        sqrt_ratio = ratio ** 0.5
+                        param.mul_(sqrt_ratio)
+                        b_param.mul_(sqrt_ratio)
+                        num_scaled += 1
+    return num_scaled
 
-    state_dict = model.state_dict()
-    for key in state_dict.keys():
-        if 'lora_A' in key:
-            A_keys.append(key)
-            B_keys.append(key.replace('lora_A', 'lora_B'))
-
-    for i in range(len(A_keys)):
-        A = state_dict[A_keys[i]]
-        B = state_dict[B_keys[i]]
-        W = B @ A
-        W *= lora_scale
-
-        if 'scale_weight_norms' in config:
-            max_norm = config['scale_weight_norms']
-            norm = W.norm().clamp(min=max_norm / 2)
-            desired = torch.clamp(norm, max=max_norm)
-            ratio = desired.cpu() / norm.cpu()
-            sqrt_ratio = ratio**0.5
-            if ratio != 1:
-                keys_scaled += 1
-                state_dict[A_keys[i]] *= sqrt_ratio
-                state_dict[B_keys[i]] *= sqrt_ratio
-        else:
-            ratio = 1.0
-        scalednorm = W.norm() * ratio
-        norms.append(scalednorm.item())
-
-    if len(norms) > 0:
-        norms = torch.tensor(norms, dtype=torch.float32)
-        if torch.any(torch.isnan(norms)):
-            raise RuntimeError(f'NaN detected in norms, probably some/all weights are NaN')
-        avg_norm = sum(norms) / len(norms)
-        max_norm = max(norms)
-    else:
-        avg_norm = 0
-        max_norm = 0
-    return keys_scaled, avg_norm, max_norm, norms
-"""
 
 def parse_layers_to_transform(spec):
     parts = spec.split(',')
@@ -636,10 +614,8 @@ if __name__ == '__main__':
     while True:
         metrics = model_engine.train_batch()
         train_dataloader.sync_epoch()
-        """
         if lora_config is not None:
-            keys_scaled, avg_norm, max_norm, norms = apply_max_norm_regularization(pipeline_model, config)
-        """
+            lora_weights_scaled = apply_lora_max_norm_regularization(pipeline_model, config)
 
         new_epoch = saver.process_epoch(epoch, step)
         finished_epoch = True if new_epoch != epoch else False
@@ -647,21 +623,19 @@ if __name__ == '__main__':
         if is_main_process() and step % config['logging_steps'] == 0:
             write_metrics(tb_writer, 'train', metrics, step)
             tb_writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], step)
-            """
-            # TODO: gather the weight norms across all stages in the pipelined model, not just the first.
-            if lora_config is not None and len(norms) > 0:
-                tb_writer.add_scalar('train/weights_scaled', keys_scaled, step)
-                tb_writer.add_scalar('train/weight_norm_avg', avg_norm, step)
-                tb_writer.add_scalar('train/weight_norm_max', max_norm, step)
-                tb_writer.add_histogram('train/weight_norm_hist', norms, step)
-            """
-            all_norms = model_engine.gather_norms()
-            if len(all_norms) > 0:
-                avg_norm = all_norms.mean().item()
-                max_norm = all_norms.max().item()
-                tb_writer.add_scalar('train/weight_norm_avg', avg_norm, step)
-                tb_writer.add_scalar('train/weight_norm_max', max_norm, step)
-                tb_writer.add_histogram('train/weight_norm_hist', all_norms.cpu().numpy(), step)            
+            if lora_config is not None:
+                tb_writer.add_scalar('train/lora_weights_scaled', lora_weights_scaled, step)
+                lora_scale = config['lora_alpha'] / config['lora_rank']
+                weight_norms = model_engine.gather_weight_norms(lora_scale)
+            else:
+                weight_norms = model_engine.gather_weight_norms()
+            if len(weight_norms) > 0:
+                tb_writer.add_scalar('train/weight_norm_min', weight_norms.min().item(), step)
+                tb_writer.add_scalar('train/weight_norm_max', weight_norms.max().item(), step)
+                tb_writer.add_scalar('train/weight_norm_avg', weight_norms.mean().item(), step)
+                tb_writer.add_scalar('train/weight_norm_std', weight_norms.std().item(), step)
+                tb_writer.add_scalar('train/weight_norm_med', weight_norms.median().item(), step)
+                tb_writer.add_histogram('train/weight_norm_hist', weight_norms.cpu().numpy(), step)            
             tb_writer.add_scalar('train/epoch', step/steps_per_epoch, step)
 
         if step % config['eval_steps'] == 0:

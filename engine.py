@@ -165,7 +165,7 @@ class CustomPipelineEngine(PipelineEngine):
         return agg_eval_losses
 
 
-    def gather_norms(self):
+    def gather_weight_norms(self, lora_scale = None):
         # Initialize a list to hold all parameter norms
         norms = []
         
@@ -184,11 +184,12 @@ class CustomPipelineEngine(PipelineEngine):
                     assert b_name in state_dict, f"Corresponding parameter {b_name} for {name} not found in state_dict"
                     b_param = state_dict[b_name]
         
-                    # Compute the composite parameter W = B @ A
-                    composite_param = b_param @ param
+                    # Compute the composite parameter W = s * (B @ A)
+                    assert lora_scale is not None, "Parameter lora_scale not set"
+                    W = lora_scale * (b_param @ param)
         
                     # Compute the norm of the composite parameter
-                    norm = composite_param.norm()
+                    norm = W.norm()
                 else:
                     # Compute the norm of regular parameters
                     norm = param.norm()
@@ -247,6 +248,10 @@ class CustomPipelineEngine(PipelineEngine):
         if self.is_data_parallel:
             dp_group = self.grid.get_data_parallel_group()
             dist.broadcast(all_norms, src=0, group=dp_group)
+
+        # Do final sanity check
+        if torch.any(torch.isnan(all_norms)):
+            raise RuntimeError(f'NaN detected in norms, probably some/all weights are NaN')
 
         return all_norms
 
