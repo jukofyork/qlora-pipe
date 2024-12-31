@@ -167,7 +167,7 @@ def evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accu
         tb_writer.add_scalar('eval/eval_time_sec', duration, step)
     return sum(loss) / len(loss) if len(loss) > 0 else None
 
-
+"""
 def apply_max_norm_regularization(model, config):
     # modifed from https://github.com/kohya-ss/sd-scripts/blob/main/networks/lora.py
     A_keys = []
@@ -213,7 +213,7 @@ def apply_max_norm_regularization(model, config):
         avg_norm = 0
         max_norm = 0
     return keys_scaled, avg_norm, max_norm, norms
-
+"""
 
 def parse_layers_to_transform(spec):
     parts = spec.split(',')
@@ -636,8 +636,10 @@ if __name__ == '__main__':
     while True:
         metrics = model_engine.train_batch()
         train_dataloader.sync_epoch()
+        """
         if lora_config is not None:
             keys_scaled, avg_norm, max_norm, norms = apply_max_norm_regularization(pipeline_model, config)
+        """
 
         new_epoch = saver.process_epoch(epoch, step)
         finished_epoch = True if new_epoch != epoch else False
@@ -645,12 +647,21 @@ if __name__ == '__main__':
         if is_main_process() and step % config['logging_steps'] == 0:
             write_metrics(tb_writer, 'train', metrics, step)
             tb_writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], step)
+            """
             # TODO: gather the weight norms across all stages in the pipelined model, not just the first.
             if lora_config is not None and len(norms) > 0:
                 tb_writer.add_scalar('train/weights_scaled', keys_scaled, step)
                 tb_writer.add_scalar('train/weight_norm_avg', avg_norm, step)
                 tb_writer.add_scalar('train/weight_norm_max', max_norm, step)
                 tb_writer.add_histogram('train/weight_norm_hist', norms, step)
+            """
+            all_norms = model_engine.gather_norms()
+            if len(all_norms) > 0:
+                avg_norm = all_norms.mean().item()
+                max_norm = all_norms.max().item()
+                tb_writer.add_scalar('train/weight_norm_avg', avg_norm, step)
+                tb_writer.add_scalar('train/weight_norm_max', max_norm, step)
+                tb_writer.add_histogram('train/weight_norm_hist', all_norms.cpu().numpy(), step)            
             tb_writer.add_scalar('train/epoch', step/steps_per_epoch, step)
 
         if step % config['eval_steps'] == 0:
