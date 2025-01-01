@@ -14,6 +14,7 @@ from deepspeed.runtime.activation_checkpointing import checkpointing as ds_check
 from deepspeed.runtime.pipe.module import PipelineModule
 from deepspeed.runtime import utils as ds_utils
 from deepspeed.runtime.pipe.module import LayerSpec
+from deepspeed.runtime.pipe.topology import ProcessTopology
 from deepspeed.runtime.pipe.schedule import (
     PipeSchedule, OptimizerStep, ReduceGrads, ReduceTiedGrads, PipeInstruction, BufferOpInstruction, LoadMicroBatch, ForwardPass, BackwardPass,
     SendActivation, RecvActivation, SendGrad, RecvGrad, _is_even, _is_odd,
@@ -163,6 +164,97 @@ class CustomPipelineEngine(PipelineEngine):
         self.set_dataiterator(train_iterator)
 
         return agg_eval_losses
+
+
+    def gather_weight_norms(self, lora_scale = None):
+        # Initialize a list to hold all parameter norms
+        norms = []
+        
+        # Fetch the state dictionary of the model
+        state_dict = self.module.state_dict()
+        
+        # Compute norms of all trainable parameters at the current stage
+        for name, param in state_dict.items():
+            # Ensure the parameter requires gradients, is a weight tensor, and is not 1D
+            if param.requires_grad and '.weight' in name and param.dim() > 1:
+                assert isinstance(param, torch.Tensor), f"Parameter {name} is not a torch.Tensor"
+                # Check if the parameter is part of a LoRa layer
+                if 'lora_A' in name:
+                    # Find the corresponding 'B' parameter
+                    b_name = name.replace('lora_A', 'lora_B')
+                    assert b_name in state_dict, f"Corresponding parameter {b_name} for {name} not found in state_dict"
+                    b_param = state_dict[b_name]
+        
+                    # Compute the composite parameter W = s * (B @ A)
+                    assert lora_scale is not None, "Parameter lora_scale not set"
+                    W = lora_scale * (b_param @ param)
+        
+                    # Compute the norm of the composite parameter
+                    norm = W.norm()
+                else:
+                    # Compute the norm of regular parameters
+                    norm = param.norm()
+        
+                # Append the computed norm to the list
+                norms.append(norm.item())
+        
+        # Convert list of norms to a tensor
+        local_norms = torch.tensor(norms, device=self.device)
+        
+        # Gather all the norms from the different pipeline stages if needed
+        if self.is_pipe_parallel:
+            # Calculate the size for this pipeline stage
+            local_size = len(local_norms)   
+            
+            # Gather sizes of norms from all pipeline stages
+            num_stages = self.grid.get_pipe_parallel_world_size()
+            sizes = [None] * num_stages
+            assert len(sizes) == num_stages, "Mismatch in the number of pipeline stages and sizes gathered"
+            dist.all_gather_object(sizes, local_size, group=self.grid.get_pipe_parallel_group())
+    
+            # Find the maximum size to pad shorter norms lists
+            max_size = max(sizes)
+            assert max_size > 0, "No norms were collected from any pipeline stage"
+    
+            # Pad local norms to max_size
+            if local_size < max_size:
+                padding = torch.zeros(max_size - local_size, device=self.device)
+                padded_local_norms = torch.cat([local_norms, padding])
+            else:
+                padded_local_norms = local_norms
+    
+            # Prepare to gather padded norms from all stages
+            gathered_norms_list = [torch.zeros(max_size, device=self.device) for _ in range(num_stages)]
+            assert len(gathered_norms_list) == num_stages, "Gathered norms list size does not match number of pipeline stages"
+    
+            # Gather padded norms across all pipeline stages
+            dist.all_gather(
+                gathered_norms_list, padded_local_norms, group=self.grid.get_pipe_parallel_group()
+            )
+    
+            # Unpad the norms according to the actual sizes
+            all_norms = []
+            for i, norms_tensor in enumerate(gathered_norms_list):
+                size = sizes[i]
+                norms = norms_tensor[:size]
+                all_norms.append(norms)
+    
+            # Concatenate all norms from all stages
+            all_norms = torch.cat(all_norms)
+        else:
+            all_norms = local_norms
+
+        # Broadcast from rank 0 to ensure consistency for all other data parallel ranks
+        # NOTE: Only used for diagnostic purposed (for now), so not really needed (yet)
+        if self.is_data_parallel:
+            dp_group = self.grid.get_data_parallel_group()
+            dist.broadcast(all_norms, src=0, group=dp_group)
+
+        # Do final sanity check
+        if torch.any(torch.isnan(all_norms)):
+            raise RuntimeError('NaN detected in norms, probably some/all weights are NaN')
+
+        return all_norms
 
 
     def _aggregate_total_losses(self):
@@ -400,10 +492,29 @@ class CustomPipelineEngine(PipelineEngine):
     PipelineEngine._INSTRUCTION_MAP[ReferenceLogitsForwardPass] = _exec_reference_logits_forward_pass
 
 
+class ColumnMajorParallelTopology(ProcessTopology):
+    """
+    A topology specialisation for hybrid data+pipeline parallelism optimized for LoRA training:
+    - Sends high-volume "per token" hidden states over PCIe/NVLink.
+    - Sends lower-volume "per step" LoRA gradient reductions over Ethernet/InfiniBand.
+    """
+    def __init__(self, num_pp, num_dp):
+        # Swap the axes and dims to change the rank mapping
+        super().__init__(axes=['data', 'pipe'], dims=[num_dp, num_pp])
+
+
 class CustomPipelineModule(PipelineModule):
-    def __init__(self, layers, model=None, **kwargs):
+    def __init__(self, layers, use_column_major_topology, model=None, **kwargs):
         # Assign to list to avoid registering the nn.Module
         self.model = [model]
+        # Hybrid LoRA data+pipeline parallelism may want to use "column-major" layout
+        if use_column_major_topology:
+            world_size = dist.get_world_size()
+            num_stages = kwargs.get('num_stages')
+            if num_stages > 1 and world_size > 1:
+                assert world_size % num_stages == 0, f"world_size ({world_size}) must be divisible by num_stages ({num_stages})"
+                num_dp = world_size // num_stages
+                kwargs['topology'] = ColumnMajorParallelTopology(num_pp=num_stages, num_dp=num_dp)
         super().__init__(layers, **kwargs)
 
     def set_dpo_reference_mode(self, dpo_reference_mode):

@@ -81,7 +81,13 @@ def write_metrics(tb_writer, prefix, metrics, step):
                 tb_writer.add_scalar(f'{prefix}/loss_quantile_{quantile:.3f}', value, step)
 
     if len(metrics) > 2:
-        entropy = metrics[2].view(-1)
+        hidden_state_mean = metrics[2].mean().item()
+        tb_writer.add_scalar(f'{prefix}/hidden_state_mean', hidden_state_mean, step)
+        hidden_state_norms = metrics[2].view(-1)
+        tb_writer.add_histogram(f'{prefix}/hidden_state_hist',  hidden_state_norms, step)
+
+    if len(metrics) > 3:
+        entropy = metrics[3].view(-1)
         tb_writer.add_scalar(f'{prefix}/entropy', entropy.mean().item(), step)
         if not args.no_quantiles:
             assert entropy.size() == losses.size(), (entropy.size(), losses.size())
@@ -92,8 +98,8 @@ def write_metrics(tb_writer, prefix, metrics, step):
             for quantile, value in zip(quantiles, entropy_quantiles):
                 tb_writer.add_scalar(f'{prefix}/entropy_quantile_{quantile:.3f}', value, step)
 
-    if len(metrics) > 3:
-        normalised_entropy = metrics[3].view(-1)
+    if len(metrics) > 4:
+        normalised_entropy = metrics[4].view(-1)
         tb_writer.add_scalar(f'{prefix}/normalised_entropy', normalised_entropy.mean().item(), step)
         if not args.no_quantiles:
             assert normalised_entropy.size() == losses.size()
@@ -104,28 +110,28 @@ def write_metrics(tb_writer, prefix, metrics, step):
             for quantile, value in zip(quantiles, normalised_entropy_quantiles):
                 tb_writer.add_scalar(f'{prefix}/normalised_entropy_quantile_{quantile:.3f}', value, step)
 
-    if len(metrics) > 4:
-        log_likelihood = metrics[4].mean()
+    if len(metrics) > 5:
+        log_likelihood = metrics[5].mean()
         tb_writer.add_scalar(f'{prefix}/log_likelihood', log_likelihood.item(), step)
         likelihood = torch.exp(-log_likelihood).item()
         tb_writer.add_scalar(f'{prefix}/likelihood', likelihood, step)
         perplexity = torch.exp(log_likelihood).item()
         tb_writer.add_scalar(f'{prefix}/perplexity', perplexity, step)
 
-    if len(metrics) > 5:
-        mcfaddens_pseudo_r2 = metrics[5].mean()
+    if len(metrics) > 6:
+        mcfaddens_pseudo_r2 = metrics[6].mean()
         tb_writer.add_scalar(f'{prefix}/mcfaddens_pseudo_r2', mcfaddens_pseudo_r2.item(), step)
 
-    if len(metrics) > 6:
-        tb_writer.add_scalar(f'{prefix}/top1_accuracy', metrics[6].mean().item(), step)
-        tb_writer.add_scalar(f'{prefix}/top5_accuracy', metrics[7].mean().item(), step)
-        tb_writer.add_scalar(f'{prefix}/top20_accuracy', metrics[8].mean().item(), step)
-
-    if len(metrics) > 9:
-        tb_writer.add_scalar(f'{prefix}/load_balancing_loss', metrics[9].mean().item(), step)
+    if len(metrics) > 7:
+        tb_writer.add_scalar(f'{prefix}/top1_accuracy', metrics[7].mean().item(), step)
+        tb_writer.add_scalar(f'{prefix}/top5_accuracy', metrics[8].mean().item(), step)
+        tb_writer.add_scalar(f'{prefix}/top20_accuracy', metrics[9].mean().item(), step)
 
     if len(metrics) > 10:
-        tb_writer.add_scalar(f'{prefix}/alternate_load_balancing_loss', metrics[10].mean().item(), step)
+        tb_writer.add_scalar(f'{prefix}/load_balancing_loss', metrics[10].mean().item(), step)
+
+    if len(metrics) > 11:
+        tb_writer.add_scalar(f'{prefix}/alternate_load_balancing_loss', metrics[11].mean().item(), step)
 
     return loss
 
@@ -167,26 +173,6 @@ def evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accu
         tb_writer.add_scalar('eval/eval_time_sec', duration, step)
     return sum(loss) / len(loss) if len(loss) > 0 else None
 
-"""
-def apply_lora_norm_regularization(model, config, current_lr):
-    assert config['lora_alpha'] == config['lora_rank'], "Used `nn.init.orthogonal_` so must have: alpha = r"
-    weight_decay = config['optimizer'].get('lora_weight_decay', 0.0)
-    weight_decay = weight_decay / config['lora_rank']  # Rank-adjustemt to account for reduced gradient signal
-    weight_decay = current_lr * weight_decay           # Scale by current scheduled learning rate
-    for name, param in model.named_parameters():
-        if 'lora_A' in name:
-            # Project each row of lora_A back onto the surface of the unit ball
-            with torch.no_grad():
-                param_fp32 = param.to(torch.float32)
-                param_fp32 /= param_fp32.norm(p=2, dim=1, keepdim=True)
-                param.copy_(param_fp32.to(param.dtype))
-        elif 'lora_B' in name and weight_decay > 0:
-            # Shrink each column of lora_B back towards the origin
-            with torch.no_grad():
-                param_fp32 = param.to(torch.float32)
-                param_fp32 *= (1.0 - weight_decay)
-                param.copy_(param_fp32.to(param.dtype))
-"""
 
 def apply_lora_regularization(model, config, current_lr, step):
     assert config['lora_alpha'] == config['lora_rank'], "Used `nn.init.orthogonal_` so must have: alpha = r"
@@ -212,51 +198,30 @@ def apply_lora_regularization(model, config, current_lr, step):
                 param.copy_(param_fp32.to(param.dtype))
 
 
-def apply_max_norm_regularization(model, config):
+def apply_lora_max_norm_regularization(model, config):
     # modifed from https://github.com/kohya-ss/sd-scripts/blob/main/networks/lora.py
-    A_keys = []
-    B_keys = []
-    norms = []
-    keys_scaled = 0
-    lora_scale = config['lora_alpha'] / config['lora_rank']
-
-    state_dict = model.state_dict()
-    for key in state_dict.keys():
-        if 'lora_A' in key:
-            A_keys.append(key)
-            B_keys.append(key.replace('lora_A', 'lora_B'))
-
-    for i in range(len(A_keys)):
-        A = state_dict[A_keys[i]]
-        B = state_dict[B_keys[i]]
-        W = B @ A
-        W *= lora_scale
-
-        if 'scale_weight_norms' in config:
-            max_norm = config['scale_weight_norms']
-            norm = W.norm().clamp(min=max_norm / 2)
-            desired = torch.clamp(norm, max=max_norm)
-            ratio = desired.cpu() / norm.cpu()
-            sqrt_ratio = ratio**0.5
-            if ratio != 1:
-                keys_scaled += 1
-                state_dict[A_keys[i]] *= sqrt_ratio
-                state_dict[B_keys[i]] *= sqrt_ratio
-        else:
-            ratio = 1.0
-        scalednorm = W.norm() * ratio
-        norms.append(scalednorm.item())
-
-    if len(norms) > 0:
-        norms = torch.tensor(norms, dtype=torch.float32)
-        if torch.any(torch.isnan(norms)):
-            raise RuntimeError(f'NaN detected in norms, probably some/all weights are NaN')
-        avg_norm = sum(norms) / len(norms)
-        max_norm = max(norms)
-    else:
-        avg_norm = 0
-        max_norm = 0
-    return keys_scaled, avg_norm, max_norm, norms
+    num_scaled = 0
+    if 'scale_weight_norms' in config:
+        max_norm = config['scale_weight_norms']
+        assert max_norm > 0, "Max norm must be positive"
+        lora_scale = config['lora_alpha'] / config['lora_rank']
+        for name, param in model.named_parameters():
+            if 'lora_A' in name:
+                b_name = name.replace('lora_A', 'lora_B')
+                b_param = next(p for n, p in model.named_parameters() if n == b_name)
+                with torch.no_grad():
+                    W = lora_scale * (b_param @ param)
+                    norm = W.norm().clamp(min=max_norm / 2)
+                    desired = torch.clamp(norm, max=max_norm)
+                    assert not torch.isnan(norm), f"'NaN detected for composite matrix: {b_name} @ {name}"
+                    assert norm > 0, f"Zero-valued norm for composite matrix: {b_name} @ {name}"
+                    ratio = desired.cpu() / norm.cpu()
+                    if ratio != 1:
+                        sqrt_ratio = ratio ** 0.5
+                        param.mul_(sqrt_ratio)
+                        b_param.mul_(sqrt_ratio)
+                        num_scaled += 1
+    return num_scaled
 
 
 def parse_layers_to_transform(spec):
@@ -350,13 +315,15 @@ def load_pipeline_model_with_lora(config, model_type):
             checkpointable_layers=checkpointable_layers,
             activation_checkpoint_func=checkpoint_func,
             partition_method=partition_method,
+            use_column_major_topology=config.get('use_column_major_topology', False),
             model=model,
         )
     else:
         pipeline_model = engine.CustomPipelineModule(
             layers=layers,
             num_stages=config['pipeline_stages'],
-            partition_method=partition_method
+            partition_method=partition_method,
+            use_column_major_topology=config.get('use_column_major_topology', False),
         )
 
     target_modules = config['target_modules'] if 'target_modules' in config else 'all-linear'
@@ -681,9 +648,8 @@ if __name__ == '__main__':
         metrics = model_engine.train_batch()
         train_dataloader.sync_epoch()
         if lora_config is not None:
-          ###apply_lora_norm_regularization(pipeline_model, config, optimizer.param_groups[0]['lr'])
-          apply_lora_regularization(pipeline_model, config, optimizer.param_groups[0]['lr'], step)
-          keys_scaled, avg_norm, max_norm, norms = apply_max_norm_regularization(pipeline_model, config)
+            apply_lora_regularization(pipeline_model, config, optimizer.param_groups[0]['lr'], step)
+            lora_weights_scaled = apply_lora_max_norm_regularization(pipeline_model, config)
 
         new_epoch = saver.process_epoch(epoch, step)
         finished_epoch = True if new_epoch != epoch else False
@@ -691,12 +657,19 @@ if __name__ == '__main__':
         if is_main_process() and step % config['logging_steps'] == 0:
             write_metrics(tb_writer, 'train', metrics, step)
             tb_writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], step)
-            # TODO: gather the weight norms across all stages in the pipelined model, not just the first.
-            if lora_config is not None and len(norms) > 0:
-                tb_writer.add_scalar('train/weights_scaled', keys_scaled, step)
-                tb_writer.add_scalar('train/weight_norm_avg', avg_norm, step)
-                tb_writer.add_scalar('train/weight_norm_max', max_norm, step)
-                tb_writer.add_histogram('train/weight_norm_hist', norms, step)
+            if lora_config is not None:
+                tb_writer.add_scalar('train/lora_weights_scaled', lora_weights_scaled, step)
+                lora_scale = config['lora_alpha'] / config['lora_rank']
+                weight_norms = model_engine.gather_weight_norms(lora_scale)
+            else:
+                weight_norms = model_engine.gather_weight_norms()
+            if len(weight_norms) > 0:
+                tb_writer.add_scalar('train/weight_norm_min', weight_norms.min().item(), step)
+                tb_writer.add_scalar('train/weight_norm_max', weight_norms.max().item(), step)
+                tb_writer.add_scalar('train/weight_norm_avg', weight_norms.mean().item(), step)
+                tb_writer.add_scalar('train/weight_norm_std', weight_norms.std().item(), step)
+                tb_writer.add_scalar('train/weight_norm_med', weight_norms.median().item(), step)
+                tb_writer.add_histogram('train/weight_norm_hist', weight_norms.cpu().numpy(), step)            
             tb_writer.add_scalar('train/epoch', step/steps_per_epoch, step)
 
         if step % config['eval_steps'] == 0:
