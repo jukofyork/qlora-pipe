@@ -689,8 +689,11 @@ if __name__ == '__main__':
         loss = evaluate(model_engine, eval_dataloaders, tb_writer, step - 1, eval_gradient_accumulation_steps)
         saver.append_eval_results(loss)
 
+    # Synchronise processes and destroy process group
+    # SEE: https://discuss.pytorch.org/t/issue-with-torchrun-multi-node-ddp-training-process-group-not-destroyed-error/214810
+    dist.barrier()
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
     if is_main_process():
         print('TRAINING COMPLETE!')
-
-    # Ensure DeepSpeed resources are released
-    deepspeed.shutdown()
