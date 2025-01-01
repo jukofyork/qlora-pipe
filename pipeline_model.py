@@ -191,6 +191,10 @@ class OutputLayer(nn.Module):
 
         with torch.no_grad():
             log_vocab_size = math.log(logits.size(-1))
+            # Compute the norms of the hidden states
+            hidden_state_norms = torch.norm(hidden_states, p=2, dim=-1)
+            hidden_state_norms = hidden_state_norms.view(-1)[flat_loss_mask]
+            # Compute the normalised entropy
             entropy = entropy_fn(flat_logits)[flat_loss_mask]
             # Compute normalised entropy so we can compare between models with different vocab sizes
             normalised_entropy = entropy / log_vocab_size
@@ -203,7 +207,7 @@ class OutputLayer(nn.Module):
             # Normal language modeling loss types (e.g. not DPO)
             loss = loss_unreduced.mean()
         loss_unreduced = loss_unreduced.detach()
-        return loss, loss_unreduced, entropy, normalised_entropy, log_likelihood, mcfaddens_pseudo_r2, *accuracies
+        return loss, loss_unreduced, hidden_state_norms, entropy, normalised_entropy, log_likelihood, mcfaddens_pseudo_r2, *accuracies
 
 
 class PipelineModel(nn.Module):
