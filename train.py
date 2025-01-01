@@ -79,7 +79,7 @@ def write_metrics(tb_writer, prefix, metrics, step):
             loss_quantiles = [sorted_losses[i] for i in quantiles_idx]
             for quantile, value in zip(quantiles, loss_quantiles):
                 tb_writer.add_scalar(f'{prefix}/loss_quantile_{quantile:.3f}', value, step)
-                
+
     if len(metrics) > 2:
         hidden_state_mean = metrics[2].mean().item()
         tb_writer.add_scalar(f'{prefix}/hidden_state_mean', hidden_state_mean, step)
