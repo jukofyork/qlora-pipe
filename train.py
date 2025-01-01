@@ -691,3 +691,6 @@ if __name__ == '__main__':
 
     if is_main_process():
         print('TRAINING COMPLETE!')
+
+    # Ensure DeepSpeed resources are released
+    deepspeed.shutdown()
