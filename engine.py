@@ -204,12 +204,13 @@ class CustomPipelineEngine(PipelineEngine):
         # Gather all the norms from the different pipeline stages if needed
         if self.is_pipe_parallel:
             # Calculate the size for this pipeline stage
-            local_size = len(local_norms)   
+            local_size = torch.tensor([len(local_norms)], device=self.device)
             
             # Gather sizes of norms from all pipeline stages
             num_stages = self.grid.get_pipe_parallel_world_size()
-            sizes = [None] * num_stages
-            torch.distributed.all_gather_object(sizes, local_size, group=self.grid.get_pipe_parallel_group())
+            sizes_tensor = torch.zeros(num_stages, dtype=torch.int64, device=self.device)
+            dist.all_gather(sizes_tensor, local_size, group=self.grid.get_pipe_parallel_group())
+            sizes = sizes_tensor.tolist()
             assert len(sizes) == num_stages, "Mismatch in the number of pipeline stages and sizes gathered"
     
             # Find the maximum size to pad shorter norms lists
@@ -217,26 +218,28 @@ class CustomPipelineEngine(PipelineEngine):
             assert max_size > 0, "No norms were collected from any pipeline stage"
     
             # Pad local norms to max_size
-            if local_size < max_size:
-                padding = torch.zeros(max_size - local_size, device=self.device)
+            if local_size.item() < max_size:
+                padding = torch.zeros(max_size - local_size.item(), device=self.device)
                 padded_local_norms = torch.cat([local_norms, padding])
             else:
                 padded_local_norms = local_norms
     
             # Prepare to gather padded norms from all stages
-            gathered_norms_list = [torch.zeros(max_size, device=self.device) for _ in range(num_stages)]
+            gathered_norms = torch.zeros(num_stages * max_size, device=self.device)
             assert len(gathered_norms_list) == num_stages, "Gathered norms list size does not match number of pipeline stages"
     
             # Gather padded norms across all pipeline stages
             dist.all_gather(
-                gathered_norms_list, padded_local_norms, group=self.grid.get_pipe_parallel_group()
+                tensor_list=[gathered_norms],
+                tensor=padded_local_norms,
+                group=self.grid.get_pipe_parallel_group()
             )
     
             # Unpad the norms according to the actual sizes
             all_norms = []
-            for i, norms_tensor in enumerate(gathered_norms_list):
-                size = sizes[i]
-                norms = norms_tensor[:size]
+            for i, size in enumerate(sizes):
+                start = i * max_size
+                norms = gathered_norms[start:start + size]
                 all_norms.append(norms)
     
             # Concatenate all norms from all stages
