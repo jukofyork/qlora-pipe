@@ -113,8 +113,9 @@ class OutputLayer(nn.Module):
         hidden_states, labels = inputs
         labels = labels.to(hidden_states.device)
         if self.logit_scale != 1.0:
-            hidden_states = hidden_states * self.logit_scale
-        logits = self.lm_head(hidden_states)
+            logits = self.lm_head(hidden_states)
+        else:
+            logits = self.lm_head(self.logit_scale * hidden_states)
         if self.logit_softcapping is not None and self.logit_softcapping > 0:
             logits = logits / self.logit_softcapping
             logits = torch.tanh(logits)
