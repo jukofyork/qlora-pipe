@@ -112,7 +112,7 @@ class OutputLayer(nn.Module):
     def forward(self, inputs):
         hidden_states, labels = inputs
         labels = labels.to(hidden_states.device)
-        if self.logit_scale != 1.0:
+        if self.logit_scale == 1.0:
             logits = self.lm_head(hidden_states)
         else:
             logits = self.lm_head(self.logit_scale * hidden_states)
