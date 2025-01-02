@@ -194,6 +194,7 @@ class OutputLayer(nn.Module):
             # Compute the norms of the hidden states
             hidden_state_norms = torch.norm(hidden_states, p=2, dim=-1)
             hidden_state_norms = hidden_state_norms.view(-1)[flat_loss_mask]
+            hidden_state_norms = hidden_state_norms.float()
             # Compute the normalised entropy
             entropy = entropy_fn(flat_logits)[flat_loss_mask]
             # Compute normalised entropy so we can compare between models with different vocab sizes
