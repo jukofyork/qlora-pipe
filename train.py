@@ -81,10 +81,10 @@ def write_metrics(tb_writer, prefix, metrics, step):
                 tb_writer.add_scalar(f'{prefix}/loss_quantile_{quantile:.3f}', value, step)
 
     if len(metrics) > 2:
-        hidden_state_mean = metrics[2].mean().item()
-        tb_writer.add_scalar(f'{prefix}/hidden_state_mean', hidden_state_mean, step)
+        hidden_norm_avg = metrics[2].mean().item()
+        tb_writer.add_scalar(f'{prefix}/hidden_norm_avg', hidden_norm_avg, step)
         hidden_state_norms = metrics[2].view(-1)
-        tb_writer.add_histogram(f'{prefix}/hidden_state_hist',  hidden_state_norms, step)
+        tb_writer.add_histogram(f'{prefix}/hidden_norm_hist',  hidden_state_norms, step)
 
     if len(metrics) > 3:
         entropy = metrics[3].view(-1)
