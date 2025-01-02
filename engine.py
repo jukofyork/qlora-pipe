@@ -210,7 +210,7 @@ class CustomPipelineEngine(PipelineEngine):
             num_stages = self.grid.get_pipe_parallel_world_size()
             sizes = [None] * num_stages
             assert len(sizes) == num_stages, "Mismatch in the number of pipeline stages and sizes gathered"
-            dist.all_gather_object(sizes, local_size, group=self.grid.get_pipe_parallel_group())
+            torch.distributed.all_gather_object(sizes, local_size, group=self.grid.get_pipe_parallel_group())
     
             # Find the maximum size to pad shorter norms lists
             max_size = max(sizes)
