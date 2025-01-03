@@ -53,6 +53,11 @@ def initialize(args=None,
     return engine, engine.optimizer
 
 
+def finalize():
+    dist.barrier()
+    dist.destroy_process_group()
+
+
 class LoadMicroBatchMultipleBuffers(PipeInstruction):
     def __init__(self, *buffer_ids, **kwargs):
         super().__init__(buffer_ids=buffer_ids, **kwargs)
