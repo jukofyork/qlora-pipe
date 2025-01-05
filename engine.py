@@ -54,7 +54,6 @@ def initialize(args=None,
 
 
 def finalize():
-    dist.barrier()
     dist.destroy_process_group()
 
 

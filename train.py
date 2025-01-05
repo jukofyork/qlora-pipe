@@ -703,7 +703,7 @@ if __name__ == '__main__':
         loss = evaluate(model_engine, eval_dataloaders, tb_writer, step - 1, eval_gradient_accumulation_steps)
         saver.append_eval_results(loss)
 
-    engine.finalize()
-
     if is_main_process():
         print('TRAINING COMPLETE!')
+
+    engine.finalize()
