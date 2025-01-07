@@ -90,7 +90,7 @@ class Saver:
             shutil.copy(self.args.config, save_dir)
             if hasattr(self.args, "deepspeed_config") and self.args.deepspeed_config is not None:
                 shutil.copy(self.args.deepspeed_config, save_dir)
-            self.remove_dir(tmp_dir)
+            self.safe_rmtree(tmp_dir)
 
 
     def save_full_model(self, name, max_shard_size='5GB'):
@@ -137,7 +137,7 @@ class Saver:
             for path in glob.glob(os.path.join(self.config['model'], '*')):
                 if os.path.basename(path) in additional_files_to_copy:
                     shutil.copy(path, save_dir)
-            self.remove_dir(tmp_dir)
+            self.safe_rmtree(tmp_dir)
 
 
     def will_save(self, type, name):
@@ -147,12 +147,12 @@ class Saver:
             self.chrono_states['step'].append(name)
             if len(self.chrono_states['step']) > self.keep_states:
                 print(f"Deleting {self.chrono_states['step'][0]}")
-                self.remove_dir(os.path.join(self.save_root, self.chrono_states['step'].pop(0)))
+                self.safe_rmtree(os.path.join(self.save_root, self.chrono_states['step'].pop(0)))
         elif type == 'global_step':
             self.chrono_states['global_step'].append(name)
             if len(self.chrono_states['global_step']) > self.keep_states:
                 print(f"Deleting {self.chrono_states['global_step'][0]}")
-                self.remove_dir(os.path.join(self.save_root, self.chrono_states['global_step'].pop(0)))
+                self.safe_rmtree(os.path.join(self.save_root, self.chrono_states['global_step'].pop(0)))
         else:
             raise ValueError(f'Unknown save type: {type}')
 
@@ -243,14 +243,16 @@ class Saver:
         deepspeed.comm.barrier()
 
 
-    def remove_dir(dir_path, max_retries=5, initial_wait_seconds=1):
-        """Attempt to remove a directory, with retries and exponential backoff waiting."""
+    # Attempt to remove a directory tree, with retries and exponential backoff.
+    def safe_rmtree(self, dir_path, max_retries=5, initial_wait_seconds=1):
         wait_seconds = initial_wait_seconds
         for attempt in range(max_retries):
+            # Sleep *FIRST* to let OS complete any pending file operations
+            time.sleep(wait_seconds)
             try:
                 shutil.rmtree(dir_path)
                 return
             except OSError as e:
-                time.sleep(wait_seconds)
+                if attempt == max_retries - 1:
+                    raise e
                 wait_seconds *= 2
-        print(f"Failed to remove directory {dir_path} after {max_retries} attempts.")
