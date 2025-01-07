@@ -296,7 +296,7 @@ class CohereForCausalLMPipe(PipelineModel, transformers.CohereForCausalLM):
                 loss_type=self.loss_type,
                 focal_loss_gamma=self.focal_loss_gamma,
                 tie_weights='model.embed_tokens.weight' if self.config.tie_word_embeddings else None,
-                _estimated_size=embedding_relative_size,
+                _estimated_size=1 #embedding_relative_size,
             )
         )
         return result
