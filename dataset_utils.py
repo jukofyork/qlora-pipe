@@ -71,6 +71,19 @@ def load_raw_dataset(dataset_path, tokenizer, sequence_len, eval_size, overlap=0
     #dataset = dataset.map(lambda x: {'tokens': slice_into_chunks(x['tokens'][0], sequence_len, overlap=overlap)}, batched=True, batch_size=1)
     dataset = dataset.map(lambda x: {'input_ids': list(yield_sequences_from_token_batch(tokenizer, x['input_ids'], sequence_len))}, batched=True, batch_size=None, remove_columns=dataset.column_names, desc='splitting')
     dataset = dataset.map(lambda x: {'attention_mask': torch.ones_like(x['input_ids']), 'labels': x['input_ids']}, desc='adding attention_mask and labels')
+    ########################################################
+    # Zero out the labels for all the "special" Cohere tokeniser tokens (+ single/double newline tokens)
+    # USE: https://huggingface.co/spaces/Xenova/the-tokenizer-playground
+    # SEE: https://huggingface.co/CohereForAI/c4ai-command-r-v01/blob/main/tokenizer.json
+    dataset = dataset.map(lambda x: {'labels': torch.where(
+        (x['labels'] <= 7) |       # special
+        (x['labels'] >= 255000) |  # special
+        (x['labels'] == 206) |     # \n
+        (x['labels'] == 2126),     # \n\n
+        torch.full_like(x['labels'], -100), 
+        x['labels']
+    )}, desc='masking special tokens')
+    #######################################################
     if eval_size > 0:
         split_datasets = dataset.train_test_split(test_size=eval_size, shuffle=True, seed=42)
         train_data = split_datasets['train']
