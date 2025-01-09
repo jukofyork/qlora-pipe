@@ -174,14 +174,19 @@ def evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accu
     return sum(loss) / len(loss) if len(loss) > 0 else None
 
 
-def apply_lora_regularization(model, config, current_lr, step):
+def apply_lora_regularization(model, config, current_lr, step = 0):
     assert config['lora_alpha'] == config['lora_rank'], "Used `nn.init.orthogonal_` so must have: alpha = r"
     weight_decay = config['optimizer'].get('lora_weight_decay', 0.0)
-    weight_decay = weight_decay / config['lora_rank']  # Normalize by rank as gradients are split across dimensions
     weight_decay = current_lr * weight_decay           # Scale by current scheduled learning rate
 
     for name, param in model.named_parameters():
-        if 'lora_A' in name and step % 4 == 0:
+        if 'lora_A' in name and step == 0:
+            # Project each row of lora_A back onto the surface of the unit ball
+            with torch.no_grad():
+                param_fp32 = param.to(torch.float32)
+                param_fp32 /= param_fp32.norm(p=2, dim=1, keepdim=True)
+                param.copy_(param_fp32.to(param.dtype))
+        elif 'lora_A' in name and step > 0 and step % 4 == 0:
             # Apply semi-orthogonal update to lora_A every 4 steps
             # SEE: Section 2.1 of "Semi-Orthogonal Low-Rank Matrix Factorization for Deep Neural Networks"
             with torch.no_grad():
@@ -669,7 +674,7 @@ if __name__ == '__main__':
         metrics = model_engine.train_batch()
         train_dataloader.sync_epoch()
         if lora_config is not None:
-            apply_lora_regularization(pipeline_model, config, optimizer.param_groups[0]['lr'], step)
+            apply_lora_regularization(pipeline_model, config, optimizer.param_groups[0]['lr'])
             keys_scaled, avg_norm, max_norm, norms = apply_max_norm_regularization(pipeline_model, config)
 
         new_epoch = saver.process_epoch(epoch, step)
